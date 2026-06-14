@@ -160,12 +160,19 @@ class ResidentTrunk:
         emb, logits_np, BS = _fb_run(t, w, ids, targets, self.d, self.dff, self.V, self.L)
         return _read_grads(t, w, emb, ids, BS, self.d, self.dff, self.V, self.L)
 
-    # --- one resident training step (resident AdamW + E host) -------------------
-    def train_step(self, ids, targets, step, lr=3e-3, betas=(0.9, 0.95), eps=1e-8, wd=0.01):
-        """Forward+backward then update IN PLACE: per-layer+final via resident
-        adamw_update (no grad readback), E via numpy AdamW (host scatter). Returns
-        the mean-CE loss at the pre-update weights. Grads are raw (un-normalized);
-        Adam is scale-robust, so this matches the numpy-trained trajectory."""
+    # --- one resident training step (resident AdamW + grad clip + E host) -------
+    def train_step(self, ids, targets, step, lr=3e-4, betas=(0.9, 0.95), eps=1e-8,
+                   wd=0.01, max_grad_norm=1.0):
+        """Forward+backward then AdamW update IN PLACE with GLOBAL grad-norm
+        clipping (standard deep-LM hygiene -- without it an L=18/350M trunk from
+        scratch NaNs on a single gradient spike). Returns (mean-CE loss, pre-clip
+        global grad-norm, skipped). The clip + mean-CE 1/B are folded into the
+        kernel grad_scale so the gradient is scaled BEFORE Adam's m/v (Adam
+        normalizes by sqrt(v), so scaling lr != scaling the gradient).
+
+        NOTE: the global norm currently reads every grad buffer back to host
+        (sum-of-squares); fine for runs, but a GPU reduction is the production win
+        (keeps the per-layer grads resident -- TODO once stability is confirmed)."""
         d, V = self.d, self.V
         ids = np.asarray(ids, dtype=np.int64); B, S = ids.shape; BS = B * S
         t = self.t; t.begin()
@@ -174,20 +181,35 @@ class ResidentTrunk:
         emb, logits_np, _ = _fb_run(t, w, ids, targets, d, self.dff, V, self.L)
         loss = _ce(logits_np, np.asarray(targets, np.int64).reshape(-1))
 
+        # E gradient (raw): host scatter of the emb grad + tied head weight grad.
+        emb_g = t.read_buffer(t.get_grad_buffer(emb), [BS, d])
+        dE = np.zeros((V, d), np.float32); np.add.at(dE, ids.reshape(-1), emb_g)
+        dE = dE + t.read_buffer(t.get_grad_buffer(E_id), [V, d])
+
+        # global L2 norm over MEAN grads (raw/BS), across ALL params incl. E.
+        sumsq = float(np.square(dE.astype(np.float64)).sum())
+        for p in self.opt:
+            g = t.read_buffer(t.get_grad_buffer(p['w']), [p['n']])
+            sumsq += float(np.square(g.astype(np.float64)).sum())
+        gnorm = float(np.sqrt(sumsq)) / BS                          # mean-grad global norm
+
+        if not np.isfinite(gnorm):
+            return loss, gnorm, True                                # poisoned grad -> SKIP (don't update)
+        clip = min(1.0, max_grad_norm / (gnorm + 1e-6)) if max_grad_norm else 1.0
+        gscale = clip / BS                                          # clip + mean-CE, applied in-kernel
+
         b1, b2 = betas; b1t, b2t = b1 ** step, b2 ** step
         t.forward_begin()
         for p in self.opt:                                          # resident AdamW, one batch
             t.adamw_update(p['w'], t.get_grad_buffer(p['w']), p['m'], p['v'], p['n'],
-                           lr, b1, b2, eps, wd, b1t, b2t, False)
+                           lr, b1, b2, eps, wd, b1t, b2t, False, gscale)
         t.forward_submit()
-        # E (tied embedding): host scatter + tied head weight grad -> numpy AdamW
-        emb_g = t.read_buffer(t.get_grad_buffer(emb), [BS, d])
-        dE = np.zeros((V, d), np.float32); np.add.at(dE, ids.reshape(-1), emb_g)
-        dE = dE + t.read_buffer(t.get_grad_buffer(E_id), [V, d])
-        self.mE = b1 * self.mE + (1 - b1) * dE
-        self.vE = b2 * self.vE + (1 - b2) * (dE * dE)
+        # E (tied embedding): numpy AdamW on the SAME clipped mean gradient
+        gE = dE * gscale
+        self.mE = b1 * self.mE + (1 - b1) * gE
+        self.vE = b2 * self.vE + (1 - b2) * (gE * gE)
         self.E_np = self.E_np * (1 - lr * wd) - lr * (self.mE / (1 - b1t)) / (np.sqrt(self.vE / (1 - b2t)) + eps)
-        return loss
+        return loss, gnorm, False
 
     # --- autoregressive generation (resident forward) ---------------------------
     def generate(self, prompt_ids, max_new_tokens=80, temperature=0.8, seed=0):
@@ -195,6 +217,8 @@ class ResidentTrunk:
         ids = list(np.asarray(prompt_ids, dtype=np.int64).reshape(-1))
         for _ in range(max_new_tokens):
             lg = self.logits(np.asarray(ids, dtype=np.int64)[None, :])[0, -1]
+            if not np.isfinite(lg).all():
+                break                                       # diverged trunk -> stop, don't crash
             if temperature <= 0:
                 nxt = int(lg.argmax())
             else:
@@ -395,8 +419,9 @@ def loss_curve_match(dev, steps=30):
 
 
 def train_cubby_resident(version="0.0.0", steps=600, data="tinystory_50k.json",
-                         B=8, S=64, lr=3e-3, max_tokens=400000, sample_every=150,
-                         prompt="Once upon a time", gen_tokens=60, dev=None):
+                         B=8, S=64, lr=3e-4, max_tokens=400000, sample_every=150,
+                         prompt="Once upon a time", gen_tokens=60, dev=None,
+                         warmup=0, max_grad_norm=1.0):
     """Train a CubbyLM via the RESIDENT backend (persistent weights + resident
     AdamW + E host path) on a BBPE-65k stream; sample periodically. The default
     `main.py train` backend. Returns (ResidentTrunk, tokenizer)."""
@@ -435,15 +460,21 @@ def train_cubby_resident(version="0.0.0", steps=600, data="tinystory_50k.json",
     print("[resident] V=%d d=%d L=%d d_ffn=%d params=%d stream=%d B=%d S=%d"
           % (cfg.total_vocab, cfg.d_model, cfg.n_layers, cfg.d_ffn,
              param_count(model), len(stream), B, S), flush=True)
-    t0 = _time.perf_counter()
+    print("[hp] lr=%.1e warmup=%d clip=%s betas=(0.9,0.95) wd=0.01" % (lr, warmup, max_grad_norm), flush=True)
+    t0 = _time.perf_counter(); nskip = 0
     for step in range(1, steps + 1):
         ids, tgt = batch()
-        loss = rt.train_step(ids, tgt, step, lr=lr)
-        if step == 1 or step % 25 == 0:
-            print("[%4d/%d] ce=%.3f ppl=%.1f (%.2f it/s)"
-                  % (step, steps, loss, np.exp(loss), step / (_time.perf_counter() - t0)), flush=True)
+        lr_t = lr * min(1.0, step / warmup) if warmup else lr      # linear LR warmup
+        loss, gnorm, skipped = rt.train_step(ids, tgt, step, lr=lr_t, max_grad_norm=max_grad_norm)
+        nskip += int(skipped)
+        if step == 1 or step % 25 == 0 or step == steps:
+            print("[%4d/%d] ce=%.3f ppl=%.1f gnorm=%.2e lr=%.1e (%.2f it/s)%s"
+                  % (step, steps, loss, np.exp(loss), gnorm, lr_t,
+                     step / (_time.perf_counter() - t0), "  [skipped]" if skipped else ""), flush=True)
         if sample_every and step % sample_every == 0:
             print("  sample:", repr(sample()), flush=True)
+    if nskip:
+        print("[warn] %d step(s) skipped (non-finite grad)" % nskip, flush=True)
     print("[done] %.1fs  final sample: %r" % (_time.perf_counter() - t0, sample()), flush=True)
     return rt, tok
 
@@ -486,9 +517,9 @@ def train_demo(dev, steps=150, tokens=400000):
     t0 = _time.perf_counter()
     for step in range(1, steps + 1):
         ids, tgt = batch()
-        loss = rt.train_step(ids, tgt, step, lr=3e-3)
+        loss, gnorm, _ = rt.train_step(ids, tgt, step, lr=3e-3)
         if step == 1 or step % 25 == 0:
-            print("  %4d   %.4f   %.1f" % (step, loss, np.exp(loss)))
+            print("  %4d   %.4f   %.1f   gnorm=%.2e" % (step, loss, np.exp(loss), gnorm))
     dt = _time.perf_counter() - t0
 
     # cubby.trace gate: a traced resident forward emits one record per block

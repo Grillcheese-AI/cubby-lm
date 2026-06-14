@@ -141,6 +141,15 @@ class Block:
         self.mix = MinGRUMixer(d)
         self.n2 = Variable(np.ones((d,), dtype=np.float32), requires_grad=True)
         self.ffn = make_ffn(cfg.ffn_type, d, cfg.d_ffn, name=f"ffn{idx}")
+        # enable_residual_scale (config 0.0.1, L>=18): GPT-2-style scaled init of
+        # each residual branch's OUTPUT projection by 1/sqrt(2L). Keeps the
+        # pre-norm residual stream bounded across deep stacks (without it L=18
+        # diverges to NaN). Pure init -> backend-agnostic (the resident path reads
+        # the same scaled weights, so forward/grad parity is preserved).
+        if getattr(cfg, "enable_residual_scale", False):
+            s = np.float32(1.0 / np.sqrt(2.0 * cfg.n_layers))
+            self.mix.proj.weight.data = (np.asarray(self.mix.proj.weight.data, np.float32) * s)
+            self.ffn.down.weight.data = (np.asarray(self.ffn.down.weight.data, np.float32) * s)
 
     def parameters(self):
         yield self.n1
