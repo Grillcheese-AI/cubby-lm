@@ -115,8 +115,7 @@ From `cubby/ROADMAP.md` (check it for the live list):
   compute/transfer. Done: fused projections (g/v/d 3?1, gate/up 2?1), GPU CE +
   in-place AdamW. **Open (the big one): perf #2 ? resident activations** (keep
   activations in VRAM across the forward to beat the ~25 ms/dispatch floor). That
-  is exactly what the grilly **`autograd-resident-backward`** branch is building;
-  this is the gating item before the full v3.3-shape (d=1024, L=18, V=65k) run.
+  is what the grilly **`autograd-resident-backward`** branch provides. **Update (June 2026):** grilly's resident forward op set is now COMPLETE and verified (embedding/rmsnorm/linear/mingru/swiglu all resident; full resident gradcheck green). What remains is the single-tape full-trunk integration + linking this trunk onto it, gated on forward parity vs the numpy trunk -- see `../grilly/AUTOGRAD_STATE.md` ("NEXT: single-tape full-trunk integration + cubby link"). That integration is the gating item before the full v3.3-shape (d=1024, L=18, V=65k) run.
 
 ## Conventions
 
