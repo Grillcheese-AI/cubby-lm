@@ -94,15 +94,13 @@ class ResidentTrunk:
 
     # --- weight registration (persistent resident + Adam moments) ---------------
     def _register_weights(self):
-        """Per-layer + final weights are PERSISTENT resident, each with persistent
-        Adam m/v -> resident AdamW updates them in place across steps. E (the tied
-        embedding) stays HOST numpy (self.E_np): its backward is a host scatter
-        (the deferred resident-embedding-backward op), so it is re-registered
-        step-scoped each forward and updated with numpy AdamW."""
+        """ALL weights -- incl. the tied embedding E -- are PERSISTENT resident,
+        each with persistent Adam m/v, so resident AdamW updates them in place.
+        E is used as both the embedding table and the tied head weight; its grad
+        (head-weight grad + embedding scatter) is assembled fully on-GPU in
+        train_step (embedding_scatter_add), so E joins self.opt with no host path."""
         t, d, dff = self.t, self.d, self.dff
         m = self.model
-        self.E_np = np.array(m.embed.data, dtype=np.float32, copy=True)   # (V, d) host
-        self.mE = np.zeros_like(self.E_np); self.vE = np.zeros_like(self.E_np)
 
         def regw(arr):
             a = _f32(arr)
@@ -110,6 +108,7 @@ class ResidentTrunk:
                         m=t.register_weight(np.zeros(a.size, np.float32)),
                         v=t.register_weight(np.zeros(a.size, np.float32)), n=int(a.size))
 
+        self.E = regw(m.embed.data)                                  # (V, d) tied, resident
         self.final = regw(m.final.data)
         self.layers = []
         for b in m.blocks:
@@ -120,14 +119,11 @@ class ResidentTrunk:
                 gate_up=regw(np.concatenate([gu[dff:2 * dff], gu[0:dff]], axis=0)),
                 down=regw(b.ffn.down.weight.data),
             ))
-        # flat list of (entry) for the optimizer sweep
-        self.opt = [self.final] + [self.layers[li][k] for li in range(self.L) for k in self._WKEYS]
+        # flat list for the optimizer sweep + GPU grad-norm (E included)
+        self.opt = [self.E, self.final] + [self.layers[li][k] for li in range(self.L) for k in self._WKEYS]
 
-    def _reg_E(self):
-        return self.t.register_input(self.E_np, True)               # step-scoped (host path)
-
-    def _w_with_E(self, E_id):
-        return dict(E=E_id, final=self.final['w'],
+    def _w(self):
+        return dict(E=self.E['w'], final=self.final['w'],
                     layers=[{k: self.layers[li][k]['w'] for k in self._WKEYS} for li in range(self.L)])
 
     # --- inference forward (+ optional cubby.trace) -----------------------------
@@ -136,7 +132,7 @@ class ResidentTrunk:
         nothing. Emits cubby.trace per block ONLY when a tracer is active (reads
         block outputs back) so production (trace OFF) pays zero overhead."""
         t = self.t; t.begin()
-        emb, logits, cap, nf, B, S = _resident_forward(t, self._w_with_E(self._reg_E()),
+        emb, logits, cap, nf, B, S = _resident_forward(t, self._w(),
                                                         ids, self.d, self.dff, self.V, self.L)
         tr = trace.current()
         if tr.level > trace.Level.OFF:
@@ -156,47 +152,41 @@ class ResidentTrunk:
         """Resident forward+backward over the persistent weights (E step-scoped).
         Returns grads in model.py layout (see _read_grads)."""
         t = self.t; t.begin()
-        w = self._w_with_E(self._reg_E())
+        w = self._w()
         emb, logits_np, BS = _fb_run(t, w, ids, targets, self.d, self.dff, self.V, self.L)
         return _read_grads(t, w, emb, ids, BS, self.d, self.dff, self.V, self.L)
 
-    # --- one resident training step (resident AdamW + grad clip + E host) -------
+    # --- one resident training step (fully on-GPU: scatter + norm + AdamW) -------
     def train_step(self, ids, targets, step, lr=3e-4, betas=(0.9, 0.95), eps=1e-8,
                    wd=0.01, max_grad_norm=1.0):
-        """Forward+backward then AdamW update IN PLACE with GLOBAL grad-norm
-        clipping (standard deep-LM hygiene -- without it an L=18/350M trunk from
-        scratch NaNs on a single gradient spike). Returns (mean-CE loss, pre-clip
-        global grad-norm, skipped). The clip + mean-CE 1/B are folded into the
-        kernel grad_scale so the gradient is scaled BEFORE Adam's m/v (Adam
-        normalizes by sqrt(v), so scaling lr != scaling the gradient).
-
-        NOTE: the global norm currently reads every grad buffer back to host
-        (sum-of-squares); fine for runs, but a GPU reduction is the production win
-        (keeps the per-layer grads resident -- TODO once stability is confirmed)."""
+        """Forward+backward then resident AdamW with GLOBAL grad-norm clipping --
+        ALL on-GPU, no grad readback. ALL params (incl. the tied embedding E)
+        update resident: E's grad = tied-head weight grad + embedding scatter,
+        assembled in place by embedding_scatter_add; the global norm is a GPU
+        reduction. clip + mean-CE 1/B are folded into the kernel grad_scale (scaled
+        BEFORE Adam m/v, since Adam normalizes by sqrt(v)). Returns (mean-CE loss,
+        pre-clip global grad-norm, skipped). Skips the step on a non-finite norm."""
         d, V = self.d, self.V
         ids = np.asarray(ids, dtype=np.int64); B, S = ids.shape; BS = B * S
         t = self.t; t.begin()
-        E_id = self._reg_E()
-        w = self._w_with_E(E_id)
+        w = self._w()
         emb, logits_np, _ = _fb_run(t, w, ids, targets, d, self.dff, V, self.L)
         loss = _ce(logits_np, np.asarray(targets, np.int64).reshape(-1))
 
-        # E gradient (raw): host scatter of the emb grad + tied head weight grad.
-        emb_g = t.read_buffer(t.get_grad_buffer(emb), [BS, d])
-        dE = np.zeros((V, d), np.float32); np.add.at(dE, ids.reshape(-1), emb_g)
-        dE = dE + t.read_buffer(t.get_grad_buffer(E_id), [V, d])
+        # E grad: scatter the embedding-output grad INTO E's grad buffer (which
+        # already holds the tied-head weight grad) -- fully resident, in place.
+        ids_u32 = t.register_input_u32(ids.reshape(-1).astype(np.uint32))
+        t.embedding_scatter_add(t.get_grad_buffer(emb), ids_u32,
+                                t.get_grad_buffer(self.E['w']), BS, d)
 
-        # global L2 norm over MEAN grads (raw/BS), across ALL params incl. E.
-        sumsq = float(np.square(dE.astype(np.float64)).sum())
-        for p in self.opt:
-            g = t.read_buffer(t.get_grad_buffer(p['w']), [p['n']])
-            sumsq += float(np.square(g.astype(np.float64)).sum())
-        gnorm = float(np.sqrt(sumsq)) / BS                          # mean-grad global norm
-
+        # global L2 norm over MEAN grads (raw/BS), ALL params on-GPU (one scalar).
+        sq = t.sum_squares([t.get_grad_buffer(p['w']) for p in self.opt],
+                           [p['n'] for p in self.opt])
+        gnorm = float(np.sqrt(float(sq))) / BS
         if not np.isfinite(gnorm):
-            return loss, gnorm, True                                # poisoned grad -> SKIP (don't update)
+            return loss, gnorm, True                                # poisoned grad -> SKIP
         clip = min(1.0, max_grad_norm / (gnorm + 1e-6)) if max_grad_norm else 1.0
-        gscale = clip / BS                                          # clip + mean-CE, applied in-kernel
+        gscale = clip / BS                                          # clip + mean-CE, in-kernel
 
         b1, b2 = betas; b1t, b2t = b1 ** step, b2 ** step
         t.forward_begin()
@@ -204,11 +194,6 @@ class ResidentTrunk:
             t.adamw_update(p['w'], t.get_grad_buffer(p['w']), p['m'], p['v'], p['n'],
                            lr, b1, b2, eps, wd, b1t, b2t, False, gscale)
         t.forward_submit()
-        # E (tied embedding): numpy AdamW on the SAME clipped mean gradient
-        gE = dE * gscale
-        self.mE = b1 * self.mE + (1 - b1) * gE
-        self.vE = b2 * self.vE + (1 - b2) * (gE * gE)
-        self.E_np = self.E_np * (1 - lr * wd) - lr * (self.mE / (1 - b1t)) / (np.sqrt(self.vE / (1 - b2t)) + eps)
         return loss, gnorm, False
 
     # --- autoregressive generation (resident forward) ---------------------------
