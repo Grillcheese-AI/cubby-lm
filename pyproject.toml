@@ -1,0 +1,21 @@
+[project]
+name = "cubby-lm"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.4.6",
+    "torch==2.4.1",
+    "torch-directml",
+    "grilly",
+]
+
+# grilly is the local Vulkan GPU framework (built from the sibling repo on disk,
+# NOT PyPI). Editable path source so `import grilly` resolves to the repo. The
+# compiled extension grilly_core.<abi>.pyd is loaded automatically by grilly's
+# __init__ (registered as the top-level `grilly_core` module, PyTorch-style) —
+# no copying into site-packages, and rebuilds via grilly/rebuild.ps1 are picked
+# up automatically since the pyd is read from the editable repo location.
+[tool.uv.sources]
+grilly = { path = "../grilly", editable = true }

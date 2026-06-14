@@ -1,0 +1,17 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+_*.py
+external
+embedding
+_scratch
+gen1.txt
+tinystory*
+_reference_torch
