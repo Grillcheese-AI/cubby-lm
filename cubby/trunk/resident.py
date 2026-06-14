@@ -34,6 +34,13 @@ if _GRILLY_ROOT not in sys.path:
     sys.path.insert(0, _GRILLY_ROOT)
 import grilly_core as gc
 
+# cubby-lm root on the path so `from cubby import trace` works when this file is
+# run as a script (as a package import it's already importable).
+_CUBBY_ROOT = r"C:\Users\grill\Documents\GitHub\cubby-lm"
+if _CUBBY_ROOT not in sys.path:
+    sys.path.insert(0, _CUBBY_ROOT)
+from cubby import trace
+
 _SPV = _GRILLY_ROOT + r"\shaders\spv"
 
 
@@ -47,6 +54,22 @@ def _R(buf, shape, rg=True):
 
 def _f32(a):
     return np.ascontiguousarray(np.asarray(a, dtype=np.float32))
+
+
+def force_numpy_reference():
+    """Make the model.py path pure-numpy so the resident grilly_core.Device() is
+    the ONLY Vulkan context. Two contexts (the resident one + model.py's
+    grilly.nn.autograd / _bridge GPU backward) nondeterministically corrupt each
+    other. Forces gpu_linear+model off the bridge AND short-circuits autograd's
+    LAZY gpu-backward singleton so model.loss().backward() never inits a 2nd
+    device (e.g. MinGRU backward). Call before building/using any CubbyLM here."""
+    import cubby.trunk.gpu_linear as _gl
+    import cubby.trunk.model as _m
+    import grilly.nn.autograd as _ag
+    _gl._GPU = False
+    _m._GPU = False
+    _ag._gpu_backward_ops_checked = True       # pretend "already checked"
+    _ag._gpu_backward_ops_cache = None         # -> no GPU backend -> CPU/numpy
 
 
 class ResidentTrunk:
@@ -67,74 +90,118 @@ class ResidentTrunk:
         self.t = gc.TapeContext(self.dev)
         self._register_weights()
 
-    # --- weight registration (persistent resident) -----------------------------
+    _WKEYS = ('n1', 'WG', 'WV', 'WD', 'n2', 'gate_up', 'down')
+
+    # --- weight registration (persistent resident + Adam moments) ---------------
     def _register_weights(self):
+        """Per-layer + final weights are PERSISTENT resident, each with persistent
+        Adam m/v -> resident AdamW updates them in place across steps. E (the tied
+        embedding) stays HOST numpy (self.E_np): its backward is a host scatter
+        (the deferred resident-embedding-backward op), so it is re-registered
+        step-scoped each forward and updated with numpy AdamW."""
         t, d, dff = self.t, self.d, self.dff
         m = self.model
-        self.E = t.register_weight(_f32(m.embed.data))               # (V, d) tied
-        self.final = t.register_weight(_f32(m.final.data))           # (d,)
+        self.E_np = np.array(m.embed.data, dtype=np.float32, copy=True)   # (V, d) host
+        self.mE = np.zeros_like(self.E_np); self.vE = np.zeros_like(self.E_np)
+
+        def regw(arr):
+            a = _f32(arr)
+            return dict(w=t.register_weight(a.copy()),
+                        m=t.register_weight(np.zeros(a.size, np.float32)),
+                        v=t.register_weight(np.zeros(a.size, np.float32)), n=int(a.size))
+
+        self.final = regw(m.final.data)
         self.layers = []
         for b in m.blocks:
-            W = _f32(b.mix.proj.weight.data)                         # (3d, d) fused gvd
-            gu = _f32(b.ffn.gate_up.weight.data)                     # (2*dff, d)
-            lw = dict(
-                n1=t.register_weight(_f32(b.n1.data)),               # (d,)
-                WG=t.register_weight(W[0:d]),                        # gvd row blocks
-                WV=t.register_weight(W[d:2 * d]),
-                WD=t.register_weight(W[2 * d:3 * d]),
-                n2=t.register_weight(_f32(b.n2.data)),               # (d,)
-                # swap the two halves: resident swiglu does x1*silu(x2), cubby
-                # does silu(gate)*up -> feed [up | gate] so it computes up*silu(gate).
-                gate_up=t.register_weight(np.concatenate([gu[dff:2 * dff], gu[0:dff]], axis=0)),
-                down=t.register_weight(_f32(b.ffn.down.weight.data)),  # (d, dff)
-            )
-            self.layers.append(lw)
+            W = _f32(b.mix.proj.weight.data); gu = _f32(b.ffn.gate_up.weight.data)
+            self.layers.append(dict(
+                n1=regw(b.n1.data), WG=regw(W[0:d]), WV=regw(W[d:2 * d]), WD=regw(W[2 * d:3 * d]),
+                n2=regw(b.n2.data),
+                gate_up=regw(np.concatenate([gu[dff:2 * dff], gu[0:dff]], axis=0)),
+                down=regw(b.ffn.down.weight.data),
+            ))
+        # flat list of (entry) for the optimizer sweep
+        self.opt = [self.final] + [self.layers[li][k] for li in range(self.L) for k in self._WKEYS]
 
-    # --- resident forward -------------------------------------------------------
+    def _reg_E(self):
+        return self.t.register_input(self.E_np, True)               # step-scoped (host path)
+
+    def _w_with_E(self, E_id):
+        return dict(E=E_id, final=self.final['w'],
+                    layers=[{k: self.layers[li][k]['w'] for k in self._WKEYS} for li in range(self.L)])
+
+    # --- inference forward (+ optional cubby.trace) -----------------------------
     def forward_ids(self, ids):
-        """Run the resident forward over integer token ids (B, S). Returns
-        (logits_buffer_id, B, S). Records nothing for backward (forward only)."""
-        d, dff, V = self.d, self.dff, self.V
-        ids = np.asarray(ids, dtype=np.int64)
-        B, S = ids.shape
-        BS = B * S
-        t = self.t
-        t.begin()
-        E_id = self.E
-        ids_u32 = t.register_input_u32(ids.reshape(-1).astype(np.uint32))
-        t.forward_begin()
-        x = t.forward_embedding(ids_u32, E_id, B, S, V, d)
-        for lw in self.layers:
-            n1 = t.forward_rmsnorm(x, lw['n1'], BS, d)
-            G = t.forward_linear(n1, lw['WG'], 0, BS, d, d)
-            Vv = t.forward_linear(n1, lw['WV'], 0, BS, d, d)
-            D = t.forward_linear(n1, lw['WD'], 0, BS, d, d)
-            H = t.forward_mingru(G, Vv, D, B, S, d)
-            x = t.forward_add(x, H, BS * d)                          # residual 1
-            n2 = t.forward_rmsnorm(x, lw['n2'], BS, d)
-            gu = t.forward_linear(n2, lw['gate_up'], 0, BS, d, 2 * dff)
-            h = t.forward_swiglu(gu, BS, dff)                        # up*silu(gate)
-            ff = t.forward_linear(h, lw['down'], 0, BS, dff, d)
-            x = t.forward_add(x, ff, BS * d)                        # residual 2
-        nf = t.forward_rmsnorm(x, self.final, BS, d)
-        logits = t.forward_linear(nf, E_id, 0, BS, d, V)            # tied head
-        t.forward_submit()
+        """Resident forward over ids (B, S) -> (logits_buffer_id, B, S). Records
+        nothing. Emits cubby.trace per block ONLY when a tracer is active (reads
+        block outputs back) so production (trace OFF) pays zero overhead."""
+        t = self.t; t.begin()
+        emb, logits, cap, nf, B, S = _resident_forward(t, self._w_with_E(self._reg_E()),
+                                                        ids, self.d, self.dff, self.V, self.L)
+        tr = trace.current()
+        if tr.level > trace.Level.OFF:
+            BS = B * S
+            with tr.scope("trunk"):
+                for li, c in enumerate(cap):
+                    r2 = t.read_buffer(c[-1], [BS, self.d]).reshape(B, S, self.d)
+                    tr.probe("block%d" % li, r2, topology="layer:%d" % li)
         return logits, B, S
 
     def logits(self, ids):
         lid, B, S = self.forward_ids(ids)
         return self.t.read_buffer(lid, [B * S, self.V]).reshape(B, S, self.V)
 
-    def _weight_ids(self):
-        return dict(E=self.E, final=self.final, layers=self.layers)
-
     # --- resident forward+backward -> grads mapped back to model.py params ------
     def grads(self, ids, targets):
-        """Resident single-tape forward+backward over the PERSISTENT weights.
-        Returns grads in model.py's layout (see _fb_grads)."""
-        self.t.begin()
-        g, _ = _fb_grads(self.t, self._weight_ids(), ids, targets, self.d, self.dff, self.V, self.L)
-        return g
+        """Resident forward+backward over the persistent weights (E step-scoped).
+        Returns grads in model.py layout (see _read_grads)."""
+        t = self.t; t.begin()
+        w = self._w_with_E(self._reg_E())
+        emb, logits_np, BS = _fb_run(t, w, ids, targets, self.d, self.dff, self.V, self.L)
+        return _read_grads(t, w, emb, ids, BS, self.d, self.dff, self.V, self.L)
+
+    # --- one resident training step (resident AdamW + E host) -------------------
+    def train_step(self, ids, targets, step, lr=3e-3, betas=(0.9, 0.95), eps=1e-8, wd=0.01):
+        """Forward+backward then update IN PLACE: per-layer+final via resident
+        adamw_update (no grad readback), E via numpy AdamW (host scatter). Returns
+        the mean-CE loss at the pre-update weights. Grads are raw (un-normalized);
+        Adam is scale-robust, so this matches the numpy-trained trajectory."""
+        d, V = self.d, self.V
+        ids = np.asarray(ids, dtype=np.int64); B, S = ids.shape; BS = B * S
+        t = self.t; t.begin()
+        E_id = self._reg_E()
+        w = self._w_with_E(E_id)
+        emb, logits_np, _ = _fb_run(t, w, ids, targets, d, self.dff, V, self.L)
+        loss = _ce(logits_np, np.asarray(targets, np.int64).reshape(-1))
+
+        b1, b2 = betas; b1t, b2t = b1 ** step, b2 ** step
+        t.forward_begin()
+        for p in self.opt:                                          # resident AdamW, one batch
+            t.adamw_update(p['w'], t.get_grad_buffer(p['w']), p['m'], p['v'], p['n'],
+                           lr, b1, b2, eps, wd, b1t, b2t, False)
+        t.forward_submit()
+        # E (tied embedding): host scatter + tied head weight grad -> numpy AdamW
+        emb_g = t.read_buffer(t.get_grad_buffer(emb), [BS, d])
+        dE = np.zeros((V, d), np.float32); np.add.at(dE, ids.reshape(-1), emb_g)
+        dE = dE + t.read_buffer(t.get_grad_buffer(E_id), [V, d])
+        self.mE = b1 * self.mE + (1 - b1) * dE
+        self.vE = b2 * self.vE + (1 - b2) * (dE * dE)
+        self.E_np = self.E_np * (1 - lr * wd) - lr * (self.mE / (1 - b1t)) / (np.sqrt(self.vE / (1 - b2t)) + eps)
+        return loss
+
+    # --- autoregressive generation (resident forward) ---------------------------
+    def generate(self, prompt_ids, max_new_tokens=80, temperature=0.8, seed=0):
+        rng = np.random.default_rng(seed)
+        ids = list(np.asarray(prompt_ids, dtype=np.int64).reshape(-1))
+        for _ in range(max_new_tokens):
+            lg = self.logits(np.asarray(ids, dtype=np.int64)[None, :])[0, -1]
+            if temperature <= 0:
+                nxt = int(lg.argmax())
+            else:
+                z = lg / temperature; z -= z.max(); p = np.exp(z); p /= p.sum()
+                nxt = int(rng.choice(len(p), p=p))
+            ids.append(nxt)
+        return ids
 
 
 def _register_layer_ids(t, P, d, dff, L, requires_grad=True):
@@ -154,20 +221,13 @@ def _register_layer_ids(t, P, d, dff, L, requires_grad=True):
     return E, final, layers
 
 
-def _fb_grads(t, w, ids, targets, d, dff, V, L):
-    """Resident single-tape forward+backward given weight buffer ids w =
-    {E, final, layers:[{n1,WG,WV,WD,n2,gate_up,down}]}. Caller has t.begin() and
-    registered the weights. Returns (grads_model_layout, logits_numpy).
-    grads: embed(V,d), final(d), per-layer lists n1,n2,proj(3d,d),gate_up(2dff,d),
-    down(d,dff) -- proj re-concats the 3 split blocks, gate_up un-swaps, embed
-    merges head-weight + scatter. mean-CE scaled (/BS)."""
-    op = gc.OpType
+def _resident_forward(t, w, ids, d, dff, V, L):
+    """Resident forward over weight buffer ids w={E,final,layers}. Caller has
+    t.begin(). Returns (emb_id, logits_id, cap, nf_id, B, S); cap[li] holds every
+    intermediate buffer id (n1,G,Vv,D,H,r1,n2,gu,h,ff,r2) for the backward record."""
     E_id, final_id, layers = w['E'], w['final'], w['layers']
     ids = np.asarray(ids, dtype=np.int64); B, S = ids.shape; BS = B * S
-    targets = np.asarray(targets, dtype=np.int64).reshape(-1)
     ids_u32 = t.register_input_u32(ids.reshape(-1).astype(np.uint32))
-    tgt_id = t.register_input(targets.astype(np.float32), False)
-
     t.forward_begin()
     emb = t.forward_embedding(ids_u32, E_id, B, S, V, d)
     x = emb; cap = []
@@ -187,7 +247,20 @@ def _fb_grads(t, w, ids, targets, d, dff, V, L):
     nf = t.forward_rmsnorm(x, final_id, BS, d)
     logits = t.forward_linear(nf, E_id, 0, BS, d, V)
     t.forward_submit()
+    return emb, logits, cap, nf, B, S
+
+
+def _fb_run(t, w, ids, targets, d, dff, V, L):
+    """Resident forward + backward (records the matching graph, one backward()).
+    Returns (emb_id, logits_numpy, BS). Grad buffers are then readable via
+    t.get_grad_buffer(weight_id) / get_grad_buffer(emb_id)."""
+    op = gc.OpType
+    E_id, final_id, layers = w['E'], w['final'], w['layers']
+    emb, logits, cap, nf, B, S = _resident_forward(t, w, ids, d, dff, V, L)
+    BS = B * S
     logits_np = t.read_buffer(logits, [BS, V])
+    targets = np.asarray(targets, dtype=np.int64).reshape(-1)
+    tgt_id = t.register_input(targets.astype(np.float32), False)
 
     x = emb
     for li, lw in enumerate(layers):
@@ -208,8 +281,16 @@ def _fb_grads(t, w, ids, targets, d, dff, V, L):
     nHead = t.record_op(op.Linear, [_R(nf, [BS, d]), _R(E_id, [V, d])], [_R(logits, [BS, V])]); t.save_for_backward(nHead, [nf, E_id])
     nCE = t.record_op(op.CrossEntropy, [_R(logits, [BS, V])], [_R(0, [1], False)]); t.save_for_backward(nCE, [logits, tgt_id])
     t.backward(nCE, 0)
+    return emb, logits_np, BS
 
-    def gr(b, sh): return t.read_buffer(t.get_grad_buffer(b), sh) / BS   # mean-CE
+
+def _read_grads(t, w, emb, ids, BS, d, dff, V, L):
+    """Read grads after _fb_run, mapped to model.py layout (mean-CE /BS): proj
+    re-concats the 3 split gvd blocks, gate_up un-swaps, embed merges head + scatter."""
+    E_id, final_id, layers = w['E'], w['final'], w['layers']
+    ids = np.asarray(ids, dtype=np.int64)
+
+    def gr(b, sh): return t.read_buffer(t.get_grad_buffer(b), sh) / BS
     out = dict(n1=[], n2=[], proj=[], gate_up=[], down=[])
     for lw in layers:
         out['n1'].append(gr(lw['n1'], [d]))
@@ -220,11 +301,15 @@ def _fb_grads(t, w, ids, targets, d, dff, V, L):
         out['down'].append(gr(lw['down'], [d, dff]))
     out['final'] = gr(final_id, [d])
     emb_g = gr(emb, [BS, d])
-    dE = np.zeros((V, d), np.float32)
-    np.add.at(dE, ids.reshape(-1), emb_g)
-    dE = dE + gr(E_id, [V, d])
-    out['embed'] = dE
-    return out, logits_np
+    dE = np.zeros((V, d), np.float32); np.add.at(dE, ids.reshape(-1), emb_g)
+    out['embed'] = dE + gr(E_id, [V, d])
+    return out
+
+
+def _fb_grads(t, w, ids, targets, d, dff, V, L):
+    """forward+backward + read grads (model.py layout). Returns (grads, logits)."""
+    emb, logits_np, BS = _fb_run(t, w, ids, targets, d, dff, V, L)
+    return _read_grads(t, w, emb, ids, BS, d, dff, V, L), logits_np
 
 
 def _snapshot(model):
@@ -270,9 +355,7 @@ def loss_curve_match(dev, steps=30):
     source, so the loss curves must track -- proving the resident path drives
     identical learning. (resident AdamW + persistent weights are gated separately
     in grilly; here AdamW is held identical to isolate the trunk.)"""
-    import cubby.trunk.gpu_linear as _gl
-    import cubby.trunk.model as _m
-    _gl._GPU = False; _m._GPU = False                       # numpy reference (one GPU ctx)
+    force_numpy_reference()                                 # numpy reference (one GPU ctx)
     from cubby.config import make_config
     from cubby.trunk.model import CubbyLM, AdamW
 
@@ -309,6 +392,124 @@ def loss_curve_match(dev, steps=30):
         res.append(_ce(logits, tgt.reshape(-1)))
         _adamw_np(P, g, m, v, step, lr, b1, b2, eps, wd)
     return ref, res
+
+
+def train_cubby_resident(version="0.0.0", steps=600, data="tinystory_50k.json",
+                         B=8, S=64, lr=3e-3, max_tokens=400000, sample_every=150,
+                         prompt="Once upon a time", gen_tokens=60, dev=None):
+    """Train a CubbyLM via the RESIDENT backend (persistent weights + resident
+    AdamW + E host path) on a BBPE-65k stream; sample periodically. The default
+    `main.py train` backend. Returns (ResidentTrunk, tokenizer)."""
+    import json
+    import time as _time
+    force_numpy_reference()                                 # resident path owns the GPU
+    from cubby.config import make_config
+    from cubby.trunk.model import CubbyLM, param_count
+    from cubby.tokenizer import make_tokenizer
+
+    import os
+    if not os.path.isabs(data) and not os.path.exists(data):
+        data = os.path.join(_CUBBY_ROOT, data)             # resolve relative to repo root
+    np.random.seed(0)
+    cfg = make_config(version)
+    tok = make_tokenizer("bbpe65k")
+    with open(data, "r", encoding="utf-8") as f:
+        stories = json.load(f)
+    sb = []
+    for s in stories:
+        sb.extend(tok.encode(s + "\n"))
+        if len(sb) >= max_tokens:
+            break
+    stream = np.asarray(sb[:max_tokens], dtype=np.int64)
+    rng = np.random.default_rng(0)
+    def batch():
+        ix = rng.integers(0, len(stream) - S - 1, size=B)
+        return (np.stack([stream[i:i + S] for i in ix]).astype(np.int64),
+                np.stack([stream[i + 1:i + 1 + S] for i in ix]).astype(np.int64))
+    def sample():
+        s = tok.decode(rt.generate(tok.encode(prompt), max_new_tokens=gen_tokens))
+        return s.encode("ascii", "backslashreplace").decode("ascii")          # cp1252 console
+
+    model = CubbyLM(cfg)
+    rt = ResidentTrunk(model, dev or make_device())
+    print("[resident] V=%d d=%d L=%d d_ffn=%d params=%d stream=%d B=%d S=%d"
+          % (cfg.total_vocab, cfg.d_model, cfg.n_layers, cfg.d_ffn,
+             param_count(model), len(stream), B, S), flush=True)
+    t0 = _time.perf_counter()
+    for step in range(1, steps + 1):
+        ids, tgt = batch()
+        loss = rt.train_step(ids, tgt, step, lr=lr)
+        if step == 1 or step % 25 == 0:
+            print("[%4d/%d] ce=%.3f ppl=%.1f (%.2f it/s)"
+                  % (step, steps, loss, np.exp(loss), step / (_time.perf_counter() - t0)), flush=True)
+        if sample_every and step % sample_every == 0:
+            print("  sample:", repr(sample()), flush=True)
+    print("[done] %.1fs  final sample: %r" % (_time.perf_counter() - t0, sample()), flush=True)
+    return rt, tok
+
+
+def train_demo(dev, steps=150, tokens=400000):
+    """Train a real CubbyLM via the RESIDENT backend on TinyStories, then
+    generate -- the train->generate gate before flipping the default. Also
+    asserts cubby.trace emission works from the resident forward."""
+    import json
+    force_numpy_reference()                                 # only the resident path owns the GPU
+    from cubby.config import make_config
+    from cubby.trunk.model import CubbyLM
+    from cubby.tokenizer import make_tokenizer
+
+    np.random.seed(0)
+    cfg = make_config("0.0.0", d_model=256, n_layers=6, d_ffn=512)   # V=65536
+    tok = make_tokenizer("bbpe65k")
+    assert tok.vocab_size == cfg.total_vocab, (tok.vocab_size, cfg.total_vocab)
+    with open(r"C:\Users\grill\Documents\GitHub\cubby-lm\tinystory_50k.json", "r", encoding="utf-8") as f:
+        stories = json.load(f)
+    sb = []
+    for s in stories:
+        sb.extend(tok.encode(s + "\n"))
+        if len(sb) >= tokens:
+            break
+    stream = np.asarray(sb[:tokens], dtype=np.int64)
+    B, S = 8, 64
+    rng = np.random.default_rng(0)
+    def batch():
+        ix = rng.integers(0, len(stream) - S - 1, size=B)
+        return (np.stack([stream[i:i + S] for i in ix]).astype(np.int64),
+                np.stack([stream[i + 1:i + 1 + S] for i in ix]).astype(np.int64))
+
+    model = CubbyLM(cfg)
+    rt = ResidentTrunk(model, dev)
+    print("=== RESIDENT CubbyLM training on TinyStories (V=%d d=%d L=%d, B=%d S=%d) ==="
+          % (cfg.total_vocab, cfg.d_model, cfg.n_layers, B, S))
+    print("    starting CE ~ ln(V) = %.3f.  step  ce  ppl" % np.log(cfg.total_vocab))
+    import time as _time
+    t0 = _time.perf_counter()
+    for step in range(1, steps + 1):
+        ids, tgt = batch()
+        loss = rt.train_step(ids, tgt, step, lr=3e-3)
+        if step == 1 or step % 25 == 0:
+            print("  %4d   %.4f   %.1f" % (step, loss, np.exp(loss)))
+    dt = _time.perf_counter() - t0
+
+    # cubby.trace gate: a traced resident forward emits one record per block
+    sink = trace.MemorySink()
+    with trace.trace_to(sink, "audit"):
+        trace.set_step(0)
+        rt.logits(batch()[0][:1])
+    nblocks = len([r for r in sink.records if r.component.startswith("block")])
+    print("\n  cubby.trace: %d/%d block records emitted from the resident forward"
+          % (nblocks, cfg.n_layers))
+
+    # train->generate gate
+    seed = tok.encode("Once upon a time")
+    out = rt.generate(seed, max_new_tokens=60, temperature=0.8, seed=0)
+    sample = tok.decode(out).encode("ascii", "backslashreplace").decode("ascii")  # cp1252 console
+    print("  sample: %r" % sample)
+    print("\n  %d steps, %.0f ms/step. CE descended -> resident-trained CubbyLM generates."
+          % (steps, 1e3 * dt / steps))
+    ok = nblocks == cfg.n_layers
+    print("RESIDENT TRAIN+GEN:", "PASS" if ok else "FAIL")
+    return ok
 
 
 def gradient_parity(model, ids, targets, dev=None):
@@ -348,20 +549,20 @@ def forward_parity(model, ids, dev=None):
 
 if __name__ == "__main__":
     import sys
+    import os
     sys.path.insert(0, r"C:\Users\grill\Documents\GitHub\cubby-lm")
+
+    if "train" in sys.argv:                              # resident train->generate gate
+        _steps = int(sys.argv[sys.argv.index("--steps") + 1]) if "--steps" in sys.argv else 150
+        ok = train_demo(make_device(), steps=_steps)
+        sys.stdout.flush()
+        os._exit(0 if ok else 1)
+
     from cubby.config import make_config
     from cubby.trunk.model import CubbyLM
 
-    import os
     import grilly.nn.autograd as _ag
-    # Force the model.py reference onto PURE NUMPY: it uses grilly.backend._bridge
-    # (a SECOND Vulkan context) for its linears/softmax, which competes with the
-    # resident grilly_core.Device() -> corrupted grads + teardown fastfail. The
-    # reference is the numpy oracle; only the resident path should touch the GPU.
-    import cubby.trunk.gpu_linear as _gl
-    import cubby.trunk.model as _m
-    _gl._GPU = False
-    _m._GPU = False
+    force_numpy_reference()                              # only the resident path owns the GPU
     np.random.seed(0)
     # small but real 0.0.0-shaped trunk for a fast parity check
     cfg = make_config("0.0.0", vocab_size=512, d_model=128, n_layers=4, d_ffn=256)

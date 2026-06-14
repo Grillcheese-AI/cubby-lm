@@ -35,7 +35,22 @@ def _todo(name: str):
 
 def cmd_smoke(args):  _todo("smoke")
 def cmd_parity(args): _todo("parity")
-def cmd_train(args):  _todo("train")
+
+
+def cmd_train(args):
+    """Train the trunk. Default backend is the GPU-resident single-tape path
+    (cubby/trunk/resident.py): forward+backward+AdamW on grilly, weights resident
+    across steps -- parity-validated vs the numpy/Python-tape model.py (forward
+    7.9e-7, gradient 2e-6, loss-curve 7e-6). `--backend tape` keeps the original
+    numpy/Python-tape trainer (cubby/trunk/train.py)."""
+    if args.backend == "tape":
+        from cubby.trunk.train import train
+        train(steps=args.steps, data_path=args.data, tok="bbpe65k")
+    else:
+        from cubby.trunk.resident import train_cubby_resident
+        train_cubby_resident(version=args.version, steps=args.steps, data=args.data)
+
+
 def cmd_gen(args):    _todo("gen")
 
 
@@ -55,6 +70,8 @@ def build_parser() -> argparse.ArgumentParser:
     tr = add("train", cmd_train, "train the trunk on grilly")
     tr.add_argument("--steps", type=int, default=4000)
     tr.add_argument("--data", default="tinystory_50k.json")
+    tr.add_argument("--backend", choices=["resident", "tape"], default="resident",
+                    help="resident = GPU-resident single tape (default); tape = numpy/Python-tape model.py")
     gn = add("gen", cmd_gen, "autoregressive generation")
     gn.add_argument("--prompt", default="Once upon a time, ")
     gn.add_argument("--max-new-tokens", type=int, default=200)
