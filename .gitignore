@@ -14,4 +14,7 @@ embedding
 _scratch
 gen1.txt
 tinystory*
-_reference_torch
+_reference_torch 
+# checkpoints (large binary .grl) 
+*.grl 
+ckpt_*.grl 
