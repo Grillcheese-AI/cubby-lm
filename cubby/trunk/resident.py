@@ -404,7 +404,7 @@ def loss_curve_match(dev, steps=30):
 
 
 def train_cubby_resident(version="0.0.0", steps=600, data="tinystory_50k.json",
-                         B=8, S=64, lr=3e-4, max_tokens=400000, sample_every=150,
+                         B=8, S=64, lr=3e-4, max_tokens=4000000, sample_every=200,
                          prompt="Once upon a time", gen_tokens=60, dev=None,
                          warmup=0, max_grad_norm=1.0):
     """Train a CubbyLM via the RESIDENT backend (persistent weights + resident
@@ -430,7 +430,18 @@ def train_cubby_resident(version="0.0.0", steps=600, data="tinystory_50k.json",
         sb.extend(tok.encode(s + "\n"))
         if len(sb) >= max_tokens:
             break
-    stream = np.asarray(sb[:max_tokens], dtype=np.int64)
+    sb = sb[:max_tokens]
+    # Model vocab smaller than the BBPE-65k tokenizer (e.g. the 'tiny' preset)?
+    # Compress ids into a dense [0, vocab) space by corpus frequency so targets
+    # never exceed the head -- keeps wordpieces, just renumbers them.
+    if cfg.total_vocab < tok.vocab_size:
+        from cubby.tokenizer import RemapTokenizer
+        tok = RemapTokenizer(tok, cfg.total_vocab, sb)
+        sb = tok.encode_base(sb)
+        print("[remap] V %d->%d  coverage=%.3f%% (rare ids -> <unk>)"
+              % (tok.base.vocab_size, tok.vocab_size, tok.coverage * 100), flush=True)
+    assert tok.vocab_size == cfg.total_vocab, (tok.vocab_size, cfg.total_vocab)
+    stream = np.asarray(sb, dtype=np.int64)
     rng = np.random.default_rng(0)
     def batch():
         ix = rng.integers(0, len(stream) - S - 1, size=B)
@@ -452,7 +463,7 @@ def train_cubby_resident(version="0.0.0", steps=600, data="tinystory_50k.json",
         lr_t = lr * min(1.0, step / warmup) if warmup else lr      # linear LR warmup
         loss, gnorm, skipped = rt.train_step(ids, tgt, step, lr=lr_t, max_grad_norm=max_grad_norm)
         nskip += int(skipped)
-        if step == 1 or step % 25 == 0 or step == steps:
+        if step == 1 or step % 1 == 0 or step == steps:
             print("[%4d/%d] ce=%.3f ppl=%.1f gnorm=%.2e lr=%.1e (%.2f it/s)%s"
                   % (step, steps, loss, np.exp(loss), gnorm, lr_t,
                      step / (_time.perf_counter() - t0), "  [skipped]" if skipped else ""), flush=True)

@@ -131,7 +131,7 @@ _R0 = dict(  # 0.0.0 substrate: grilly MinGRU + tied-linear + SwiGLU
     vocab_size=65536, d_model=256, n_layers=6, d_ffn=512, seq_len=512,
     enable_residual_scale=False,
 )
-_R1 = dict(_R0, d_model=1024, n_layers=18, d_ffn=4096, seq_len=4096,
+_R1 = dict(_R0, d_model=1024, n_layers=18, d_ffn=4096, seq_len=512,
            enable_residual_scale=True)                  # 0.0.1 scale to v3.3 shape
 _R2 = dict(_R1, enable_attention=True)                  # 0.0.2 +chunked SWA (context)
 _R3 = dict(_R2, enable_moe=True)                        # 0.0.3 +sparse MoE-MinGRU
@@ -145,6 +145,7 @@ _R9 = dict(_R8, enable_adapter_bank=True)               # 0.0.9 +no-retrain adap
 VERSIONS: dict[str, dict] = {
     "0.0.0": _R0, "0.0.1": _R1, "0.0.2": _R2, "0.0.3": _R3, "0.0.4": _R4,
     "0.0.5": _R5, "0.0.6": _R6, "0.0.7": _R7, "0.0.8": _R8, "0.0.9": _R9,
+    "tiny": dict(_R1, vocab_size=10000, d_model=1024, n_layers=12, d_ffn=2048, seq_len=256),  # toy config for quick iteration
 }
 
 DEFAULT_VERSION = "0.0.0"
