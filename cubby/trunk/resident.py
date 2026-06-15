@@ -406,7 +406,8 @@ def loss_curve_match(dev, steps=30):
 def train_cubby_resident(version="0.0.0", steps=600, data="tinystory_50k.json",
                          B=8, S=64, lr=3e-4, max_tokens=4000000, sample_every=200,
                          prompt="Once upon a time", gen_tokens=60, dev=None,
-                         warmup=0, max_grad_norm=1.0):
+                         warmup=0, max_grad_norm=1.0,
+                         ckpt_path=None, ckpt_every=100, resume=True, max_consec_skips=10):
     """Train a CubbyLM via the RESIDENT backend (persistent weights + resident
     AdamW + E host path) on a BBPE-65k stream; sample periodically. The default
     `main.py train` backend. Returns (ResidentTrunk, tokenizer)."""
@@ -451,24 +452,60 @@ def train_cubby_resident(version="0.0.0", steps=600, data="tinystory_50k.json",
         s = tok.decode(rt.generate(tok.encode(prompt), max_new_tokens=gen_tokens))
         return s.encode("ascii", "backslashreplace").decode("ascii")          # cp1252 console
 
+    from cubby.trunk import checkpoint as _ckpt
+    if ckpt_path is None:
+        ckpt_path = os.path.join(_CUBBY_ROOT, "ckpt_%s.grl" % version)
+
     model = CubbyLM(cfg)
+    start_step = 0
+    if resume and os.path.exists(ckpt_path):
+        _ms, _meta = _ckpt.load_checkpoint(ckpt_path)
+        if _ckpt.checkpoint_matches(_meta, cfg):
+            _ckpt.apply_model_state(model, _ms)            # restore BEFORE ResidentTrunk()
+            start_step = int(_meta.get("step", 0))
+            rng = _ckpt.restore_rng(_meta)                 # continue the SAME data stream
+            print("[resume] %s @ step %d" % (ckpt_path, start_step), flush=True)
+        else:
+            print("[resume] shape mismatch, ignoring %s" % ckpt_path, flush=True)
     rt = ResidentTrunk(model, dev or make_device())
     print("[resident] V=%d d=%d L=%d d_ffn=%d params=%d stream=%d B=%d S=%d"
           % (cfg.total_vocab, cfg.d_model, cfg.n_layers, cfg.d_ffn,
              param_count(model), len(stream), B, S), flush=True)
     print("[hp] lr=%.1e warmup=%d clip=%s betas=(0.9,0.95) wd=0.01" % (lr, warmup, max_grad_norm), flush=True)
+    guard = _ckpt.SkipGuard(max_consecutive=max_consec_skips)
+    step = start_step
+    def _save(tag):
+        try:
+            _ckpt.save_checkpoint(ckpt_path, rt, step=step, rng=rng, version=version,
+                                  lr=lr, warmup=warmup, max_grad_norm=max_grad_norm)
+            print("[ckpt] %s @ step %d -> %s" % (tag, step, ckpt_path), flush=True)
+        except Exception as _e:
+            print("[ckpt] save FAILED (%s): %r" % (tag, _e), flush=True)
+
     t0 = _time.perf_counter(); nskip = 0
-    for step in range(1, steps + 1):
-        ids, tgt = batch()
-        lr_t = lr * min(1.0, step / warmup) if warmup else lr      # linear LR warmup
-        loss, gnorm, skipped = rt.train_step(ids, tgt, step, lr=lr_t, max_grad_norm=max_grad_norm)
-        nskip += int(skipped)
-        if step == 1 or step % 1 == 0 or step == steps:
+    try:
+        for step in range(start_step + 1, steps + 1):
+            ids, tgt = batch()
+            lr_t = lr * min(1.0, step / warmup) if warmup else lr  # linear LR warmup
+            loss, gnorm, skipped = rt.train_step(ids, tgt, step, lr=lr_t, max_grad_norm=max_grad_norm)
+            nskip += int(skipped)
             print("[%4d/%d] ce=%.3f ppl=%.1f gnorm=%.2e lr=%.1e (%.2f it/s)%s"
                   % (step, steps, loss, np.exp(loss), gnorm, lr_t,
                      step / (_time.perf_counter() - t0), "  [skipped]" if skipped else ""), flush=True)
-        if sample_every and step % sample_every == 0:
-            print("  sample:", repr(sample()), flush=True)
+            if guard.update(skipped):                             # K-in-a-row -> divergence
+                print("[abort] %d consecutive non-finite grads" % guard.max_consecutive, flush=True)
+                _save("diverge"); break
+            if sample_every and step % sample_every == 0:
+                print("  sample:", repr(sample()), flush=True)
+            if ckpt_every and step % ckpt_every == 0:
+                _save("periodic")
+    except KeyboardInterrupt:
+        print("[interrupt] flushing checkpoint", flush=True); _save("interrupt"); raise
+    except Exception as _e:                                       # OOM / any in-step failure
+        print("[error] step %d: %r -> emergency checkpoint" % (step, _e), flush=True)
+        _save("emergency"); raise
+    else:
+        _save("final")
     if nskip:
         print("[warn] %d step(s) skipped (non-finite grad)" % nskip, flush=True)
     print("[done] %.1fs  final sample: %r" % (_time.perf_counter() - t0, sample()), flush=True)
