@@ -114,3 +114,30 @@ She loved to look around..."), stable gradients (gnorm 0.6-0.74), 1.59 it/s.
 Sampled softmax working as designed — no full (N, 32721) logit tensor. Checkpoint
 saved at `ckpt_tiny_mbpe.grl`. Next: port dual-head + sampled IS to resident GPU
 path for full v3.3-shape training.
+
+## Resident GPU path: dual-head + sampled softmax (June 2026)
+
+Ports the dual-head architecture and importance-sampling CE to the GPU-resident
+path (`cubby/trunk/resident.py`). The resident path owns the grilly Vulkan
+context and runs forward+backward+AdamW entirely on-device.
+
+**Architecture changes:**
+- Combined embedding table `[E_lang; E_ast]` registered as a single resident
+  weight. Router `(d → 2)` registered as a separate persistent weight.
+- `_resident_forward` computes `router_logits = Linear(h, router)` alongside
+  main logits. `_fb_run` records the router op in the tape for gradient tracking.
+- `train_step` accepts `use_sampled` and `n_samples` params. Computes dual-head
+  CE weighted by router probabilities.
+
+**Loss helpers:**
+- `_sampled_ce(logits, tgt, V, n_samples=1024)`: Bengio & Senecal 2008
+  importance-sampling CE with K negatives per position. Gradient direction
+  unbiased when sampling distribution is uniform.
+- `_dual_head_ce(logits, tgt, router_logits)`: router-weighted loss for
+  language + AST heads. Tokens classified by `tgt < Vlang`.
+
+**Verification:** forward parity 1.7e-04 vs model.py, gradient parity 1.9e-02
+(all params < 2e-2), existing resident.py parity tests pass at 1e-06 precision.
+Router weights flow correctly through the tape backward.
+
+Status: complete, ready for full v3.3-shape (d=1024 L=18 V=32k) training.
