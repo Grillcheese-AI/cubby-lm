@@ -84,7 +84,11 @@ class ResidentTrunk:
         self.d = int(cfg.d_model)
         self.L = int(cfg.n_layers)
         self.dff = int(cfg.d_ffn)
-        self.V = int(cfg.total_vocab)
+        self.dual_head = getattr(cfg, 'enable_dual_head', False) and \
+                         hasattr(model, 'embed_ast') and model.embed_ast is not None
+        self.Vlang = int(cfg.vocab_size) if self.dual_head else int(cfg.total_vocab)
+        self.Vast = int(cfg.total_vocab) - self.Vlang if self.dual_head else 0
+        self.V = int(cfg.total_vocab)  # total vocab (Vlang + Vast)
         self.model = model
         self.dev = dev or make_device()
         self.t = gc.TapeContext(self.dev)
@@ -98,7 +102,10 @@ class ResidentTrunk:
         each with persistent Adam m/v, so resident AdamW updates them in place.
         E is used as both the embedding table and the tied head weight; its grad
         (head-weight grad + embedding scatter) is assembled fully on-GPU in
-        train_step (embedding_scatter_add), so E joins self.opt with no host path."""
+        train_step (embedding_scatter_add), so E joins self.opt with no host path.
+
+        Dual-head: register combined embedding E_combined = [E_lang; E_ast] as
+        a single resident weight, plus router (d -> 2) as a separate weight."""
         t, d, dff = self.t, self.d, self.dff
         m = self.model
 
@@ -108,7 +115,18 @@ class ResidentTrunk:
                         m=t.register_weight(np.zeros(a.size, np.float32)),
                         v=t.register_weight(np.zeros(a.size, np.float32)), n=int(a.size))
 
-        self.E = regw(m.embed.data)                                  # (V, d) tied, resident
+        if self.dual_head:
+            # Combined embedding table (V_total, d) = concat of E_lang + E_ast
+            E_combined = np.concatenate([
+                np.asarray(m.embed_lang.data, np.float32),
+                np.asarray(m.embed_ast.data, np.float32)
+            ], axis=0)
+            self.E = regw(E_combined)
+            # Router: linear (d -> 2)
+            self.router = regw(np.asarray(m.router.data, np.float32))
+        else:
+            self.E = regw(m.embed.data)                                  # (V, d) tied, resident
+            self.router = None
         self.final = regw(m.final.data)
         self.layers = []
         for b in m.blocks:
@@ -120,11 +138,15 @@ class ResidentTrunk:
                 down=regw(b.ffn.down.weight.data),
             ))
         # flat list for the optimizer sweep + GPU grad-norm (E included)
-        self.opt = [self.E, self.final] + [self.layers[li][k] for li in range(self.L) for k in self._WKEYS]
+        head_weights = [self.E, self.final] + ([self.router] if self.router is not None else [])
+        self.opt = head_weights + [self.layers[li][k] for li in range(self.L) for k in self._WKEYS]
 
     def _w(self):
-        return dict(E=self.E['w'], final=self.final['w'],
-                    layers=[{k: self.layers[li][k]['w'] for k in self._WKEYS} for li in range(self.L)])
+        w = dict(E=self.E['w'], final=self.final['w'],
+                 layers=[{k: self.layers[li][k]['w'] for k in self._WKEYS} for li in range(self.L)])
+        if self.router is not None:
+            w['router'] = self.router['w']
+        return w
 
     # --- inference forward (+ optional cubby.trace) -----------------------------
     def forward_ids(self, ids):
@@ -132,8 +154,8 @@ class ResidentTrunk:
         nothing. Emits cubby.trace per block ONLY when a tracer is active (reads
         block outputs back) so production (trace OFF) pays zero overhead."""
         t = self.t; t.begin()
-        emb, logits, cap, nf, B, S = _resident_forward(t, self._w(),
-                                                        ids, self.d, self.dff, self.V, self.L)
+        emb, logits, cap, nf, B, S, _router = _resident_forward(
+            t, self._w(), ids, self.d, self.dff, self.V, self.L)
         tr = trace.current()
         if tr.level > trace.Level.OFF:
             BS = B * S
@@ -153,25 +175,46 @@ class ResidentTrunk:
         Returns grads in model.py layout (see _read_grads)."""
         t = self.t; t.begin()
         w = self._w()
-        emb, logits_np, BS = _fb_run(t, w, ids, targets, self.d, self.dff, self.V, self.L)
+        emb, logits_np, BS, _, _, _, _, _ = _fb_run(
+            t, w, ids, targets, self.d, self.dff, self.V, self.L)
         return _read_grads(t, w, emb, ids, BS, self.d, self.dff, self.V, self.L)
 
     # --- one resident training step (fully on-GPU: scatter + norm + AdamW) -------
     def train_step(self, ids, targets, step, lr=3e-4, betas=(0.9, 0.95), eps=1e-8,
-                   wd=0.01, max_grad_norm=1.0):
+                   wd=0.01, max_grad_norm=1.0, n_samples=1024, use_sampled=False):
         """Forward+backward then resident AdamW with GLOBAL grad-norm clipping --
         ALL on-GPU, no grad readback. ALL params (incl. the tied embedding E)
         update resident: E's grad = tied-head weight grad + embedding scatter,
         assembled in place by embedding_scatter_add; the global norm is a GPU
         reduction. clip + mean-CE 1/B are folded into the kernel grad_scale (scaled
         BEFORE Adam m/v, since Adam normalizes by sqrt(v)). Returns (mean-CE loss,
-        pre-clip global grad-norm, skipped). Skips the step on a non-finite norm."""
+        pre-clip global grad-norm, skipped). Skips the step on a non-finite norm.
+        
+        Dual-head: computes CE separately for language and AST token subsets,
+        weighted by the mean router probability for each head.
+        Sampled softmax: if `use_sampled`, draws K=n_samples negatives per
+        position and computes CE only over the K+1 subset (Bengio & Senecal 2008).
+        """
         d, V = self.d, self.V
         ids = np.asarray(ids, dtype=np.int64); B, S = ids.shape; BS = B * S
         t = self.t; t.begin()
         w = self._w()
-        emb, logits_np, _ = _fb_run(t, w, ids, targets, d, self.dff, V, self.L)
-        loss = _ce(logits_np, np.asarray(targets, np.int64).reshape(-1))
+        Vlang = self.Vlang if self.dual_head else None
+        Vast = self.Vast if self.dual_head else None
+        emb, logits_np, _, router_logits_np, _, _, _, _ = _fb_run(
+            t, w, ids, targets, d, self.dff, V, self.L, Vlang, Vast)
+        tgt = np.asarray(targets, np.int64).reshape(-1)
+
+        if self.dual_head and router_logits_np is not None:
+            loss, rw = _dual_head_ce(logits_np, tgt, router_logits_np, Vlang, Vast,
+                                     n_samples=n_samples, use_sampled=use_sampled,
+                                     d_model=d)
+        else:
+            if use_sampled:
+                loss = _sampled_ce(logits_np, tgt, V, n_samples=n_samples, d=d)
+            else:
+                loss = _ce(logits_np, tgt)
+            rw = None
 
         # E grad: scatter the embedding-output grad INTO E's grad buffer (which
         # already holds the tied-head weight grad) -- fully resident, in place.
@@ -231,10 +274,12 @@ def _register_layer_ids(t, P, d, dff, L, requires_grad=True):
 
 
 def _resident_forward(t, w, ids, d, dff, V, L):
-    """Resident forward over weight buffer ids w={E,final,layers}. Caller has
-    t.begin(). Returns (emb_id, logits_id, cap, nf_id, B, S); cap[li] holds every
-    intermediate buffer id (n1,G,Vv,D,H,r1,n2,gu,h,ff,r2) for the backward record."""
+    """Resident forward over weight buffer ids w={E,final,layers[,router]}. Caller has
+    t.begin(). Returns (emb_id, logits_id, cap, nf_id, B, S, router_logits_id).
+    cap[li] holds every intermediate buffer id (n1,G,Vv,D,H,r1,n2,gu,h,ff,r2)
+    for the backward record. router_logits_id is None if no router in w."""
     E_id, final_id, layers = w['E'], w['final'], w['layers']
+    router_id = w.get('router')
     ids = np.asarray(ids, dtype=np.int64); B, S = ids.shape; BS = B * S
     ids_u32 = t.register_input_u32(ids.reshape(-1).astype(np.uint32))
     t.forward_begin()
@@ -255,19 +300,29 @@ def _resident_forward(t, w, ids, d, dff, V, L):
         cap.append((n1, G, Vv, D, H, r1, n2, gu, h, ff, r2)); x = r2
     nf = t.forward_rmsnorm(x, final_id, BS, d)
     logits = t.forward_linear(nf, E_id, 0, BS, d, V)
+    router_logits_id = None
+    if router_id is not None:
+        router_logits_id = t.forward_linear(nf, router_id, 0, BS, d, 2)
     t.forward_submit()
-    return emb, logits, cap, nf, B, S
+    return emb, logits, cap, nf, B, S, router_logits_id
 
 
-def _fb_run(t, w, ids, targets, d, dff, V, L):
+def _fb_run(t, w, ids, targets, d, dff, V, L, Vlang=None, Vast=None):
     """Resident forward + backward (records the matching graph, one backward()).
-    Returns (emb_id, logits_numpy, BS). Grad buffers are then readable via
-    t.get_grad_buffer(weight_id) / get_grad_buffer(emb_id)."""
+    Returns (emb_id, logits_numpy, BS, router_logits_np, nf_id, logits_id, Vlang, Vast).
+    Grad buffers are then readable via t.get_grad_buffer(weight_id) / get_grad_buffer(emb_id).
+    Vlang/Vast partition the combined logits into language and AST regions for
+    dual-head loss computation."""
     op = gc.OpType
     E_id, final_id, layers = w['E'], w['final'], w['layers']
-    emb, logits, cap, nf, B, S = _resident_forward(t, w, ids, d, dff, V, L)
+    router_id = w.get('router')
+    emb, logits, cap, nf, B, S, router_logits_id = _resident_forward(
+        t, w, ids, d, dff, V, L)
     BS = B * S
     logits_np = t.read_buffer(logits, [BS, V])
+    router_logits_np = None
+    if router_logits_id is not None:
+        router_logits_np = t.read_buffer(router_logits_id, [BS, 2])
     targets = np.asarray(targets, dtype=np.int64).reshape(-1)
     tgt_id = t.register_input(targets.astype(np.float32), False)
 
@@ -288,9 +343,11 @@ def _fb_run(t, w, ids, targets, d, dff, V, L):
         x = r2
     nFin = t.record_op(op.RMSNorm, [_R(x, [BS, d]), _R(final_id, [d])], [_R(nf, [BS, d])]); t.save_for_backward(nFin, [x, final_id])
     nHead = t.record_op(op.Linear, [_R(nf, [BS, d]), _R(E_id, [V, d])], [_R(logits, [BS, V])]); t.save_for_backward(nHead, [nf, E_id])
+    if router_logits_id is not None:
+        nRouter = t.record_op(op.Linear, [_R(nf, [BS, d]), _R(router_id, [2, d])], [_R(router_logits_id, [BS, 2])]); t.save_for_backward(nRouter, [nf, router_id])
     nCE = t.record_op(op.CrossEntropy, [_R(logits, [BS, V])], [_R(0, [1], False)]); t.save_for_backward(nCE, [logits, tgt_id])
     t.backward(nCE, 0)
-    return emb, logits_np, BS
+    return emb, logits_np, BS, router_logits_np, nf, logits, Vlang, Vast
 
 
 def _read_grads(t, w, emb, ids, BS, d, dff, V, L):
@@ -338,6 +395,105 @@ def _snapshot(model):
 def _ce(logits, tgt):
     z = logits - logits.max(1, keepdims=True); e = np.exp(z); sm = e / e.sum(1, keepdims=True)
     return float(-np.log(sm[np.arange(len(tgt)), tgt] + 1e-12).mean())
+
+
+def _sampled_ce(logits, tgt, V, n_samples=1024, d=1024):
+    """Importance-sampled CE (Bengio & Senecal 2008): for each position, draw
+    K=n_samples uniform negatives from [0, V), compute CE only over the K+1
+    subset (target + negatives). With uniform sampling, the IS correction is a
+    constant that cancels in softmax -- gradient direction is unbiased.
+    
+    Args:
+        logits: (BS, V) full logits from GPU
+        tgt: (BS,) target token IDs
+        V: total vocab size
+        n_samples: number of negative samples per position
+        d: model dimension (unused, kept for API compat)
+    
+    Returns: scalar CE loss over the sampled subsets
+    """
+    BS = logits.shape[0]
+    K = n_samples
+    
+    # Draw K negatives per position
+    neg = np.random.randint(0, V, size=(BS, K), dtype=np.int64)
+    
+    # Build subset indices: [target, neg1, neg2, ..., negK] for each position
+    # Shape: (BS, K+1)
+    subset_ids = np.concatenate([tgt[:, None], neg], axis=1)
+    
+    # Gather logits for the subset
+    # For each position i, we need logits[i, subset_ids[i, :]]
+    batch_idx = np.arange(BS)[:, None]
+    subset_logits = logits[batch_idx, subset_ids]  # (BS, K+1)
+    
+    # CE over the subset (target is always at index 0)
+    z = subset_logits - subset_logits.max(axis=1, keepdims=True)
+    e = np.exp(z)
+    sm = e / e.sum(axis=1, keepdims=True)
+    target_logits = sm[:, 0]  # probability of the true target in the subset
+    loss = float(-np.log(target_logits + 1e-12).mean())
+    return loss
+
+
+def _dual_head_ce(logits, tgt, router_logits, Vlang, Vast,
+                  n_samples=1024, use_sampled=False, d_model=1024):
+    """Dual-head CE loss with router weighting.
+    
+    Args:
+        logits: (BS, V_total) combined language+AST logits from GPU
+        tgt: (BS,) target token IDs
+        router_logits: (BS, 2) router raw logits
+        Vlang: language vocab size
+        Vast: AST vocab size
+        n_samples: number of negatives for sampled softmax
+        use_sampled: whether to use sampled softmax
+        d_model: model dimension
+    
+    Returns:
+        loss: combined loss (language + AST, weighted by router)
+        rw: (BS, 2) router weights (softmax over router_logits)
+    """
+    BS = logits.shape[0]
+    
+    # Compute router weights
+    rl = router_logits - router_logits.max(axis=1, keepdims=True)
+    rw = np.exp(rl)
+    rw = rw / rw.sum(axis=1, keepdims=True)  # (BS, 2)
+    
+    # Classify tokens: language (id < Vlang) vs AST (id >= Vlang)
+    is_lang = (tgt < Vlang)
+    is_ast = (tgt >= Vlang)
+    
+    # Language head loss
+    lang_logits = logits[:, :Vlang]  # (BS, Vlang)
+    if use_sampled:
+        lang_loss = _sampled_ce(lang_logits, tgt, Vlang, n_samples=n_samples, d=d_model)
+    else:
+        lang_loss = _ce(lang_logits, tgt)
+    
+    # Weight language loss by mean router weight for language (channel 0)
+    w_lang = rw[:, 0].mean()
+    lang_weighted = w_lang * lang_loss
+    
+    # AST head loss (only for AST tokens)
+    ast_loss = 0.0
+    n_ast = is_ast.sum()
+    if n_ast > 0 and Vast > 0:
+        ast_logits = logits[:, Vlang:]  # (BS, Vast)
+        ast_tgt = tgt - Vlang  # shift to [0, Vast)
+        if use_sampled:
+            ast_loss = _sampled_ce(ast_logits, ast_tgt, Vast, n_samples=n_samples, d=d_model)
+        else:
+            ast_loss = _ce(ast_logits, ast_tgt)
+    
+    # Weight AST loss by mean router weight for AST (channel 1)
+    w_ast = rw[:, 1].mean()
+    ast_weighted = w_ast * ast_loss
+    
+    # Combined loss
+    loss = lang_weighted + ast_weighted
+    return loss, rw
 
 
 def _adamw_np(P, g, m, v, step, lr, b1, b2, eps, wd):
