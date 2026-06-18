@@ -19,10 +19,35 @@ from dataclasses import dataclass, field, replace
 @dataclass
 class SparseCubbyConfig:
     # ── tokenizer / vocab ────────────────────────────────────────────────
-    vocab_size: int = 65536           # BBPE-65k v3 (grillcheese_bbpe65k_v3)
-    # structured/AST control tokens registered as atomic special tokens on the
-    # BBPE so cubelang/agent DSL markers never fragment (see tokenizer/).
-    n_special_tokens: int = 0
+    vocab_size: int = 65536           # base BPE vocab (language region)
+    tokenizer_kind: str = "bbpe65k"   # "bbpe65k" | "multilingual_bpe" | "byte"
+    tokenizer_path: str = ""          # explicit path override (empty = use default)
+    # structured/AST control tokens registered as atomic special tokens so
+    # cubelang/agent DSL markers never fragment. In multilingual_bpe these live
+    # at the tail of the vocab (IDs >= ast_start_id); the language head covers
+    # [0, ast_start_id) and the AST head covers [ast_start_id, total_vocab).
+    n_special_tokens: int = 0         # set from tokenizer.n_special_tokens at build time
+
+    # ── output head: dual-head architecture (language + AST) ──────────
+    # The single shared trunk projects to two separate output heads, gated by
+    # a learned router. Language loss uses the language head; AST loss uses
+    # the AST head. At generation time the router picks which head to decode from.
+    enable_dual_head: bool = False
+    router_d: int = 2                 # language vs AST (extendable to more routes)
+    ast_head_d_ffn: int = 0           # 0 = no FFN in AST head (just RMSNorm + linear)
+    tie_lang_embeddings: bool = True  # tie language output proj to embed_lang
+    tie_ast_embeddings: bool = True   # tie AST output proj to embed_ast
+
+    # ── sampled softmax (importance sampling, training only) ──────────
+    # Replace full softmax/CE with sampled importance-sampling CE during training.
+    # At inference, full softmax is used (cheap at 30k vocab; the GPU handles it).
+    enable_sampled_softmax: bool = False
+    n_samples: int = 1024             # number of negative samples per token
+    sampler: str = "uniform"          # "uniform" | "log_uniform" | "model"
+
+    # ── old / compat ───────────────────────────────────────────────────
+    head_type: str = "linear"         # kept for config compat; "linear" | "vsa"
+    tie_embeddings: bool = True       # kept for compat; see tie_lang_embeddings
 
     # ── trunk dims (v3.3 production shape) ───────────────────────────────
     d_model: int = 1024
@@ -36,12 +61,9 @@ class SparseCubbyConfig:
     enable_residual_scale: bool = True  # per-residual alpha (helps at L>=18)
     dtype: str = "fp32"               # grilly trunk: fp32 | bf16
 
-    # ── output head ──────────────────────────────────────────────────────
-    # "linear" = weight-tied linear (the v4 fix, default for the word vocab).
-    # "vsa"    = frozen MAP-bipolar binding head (D=vsa_d), cosine readout —
-    #            enables the downstream VSA reasoning substrate; off until vetted.
-    head_type: str = "linear"
-    tie_embeddings: bool = True
+    # ── VSA binding head (0.0.6) ─────────────────────────────────────────
+    # "vsa" = frozen MAP-bipolar binding head (D=vsa_d), cosine readout —
+    #         enables the downstream VSA reasoning substrate; off until vetted.
     vsa_d: int = 10240
     vsa_seed: int = 0xC0DEB00C
     vsa_temperature: str = "learned"     # "learned" | "<float>" (v4 froze it)
@@ -145,7 +167,13 @@ _R9 = dict(_R8, enable_adapter_bank=True)               # 0.0.9 +no-retrain adap
 VERSIONS: dict[str, dict] = {
     "0.0.0": _R0, "0.0.1": _R1, "0.0.2": _R2, "0.0.3": _R3, "0.0.4": _R4,
     "0.0.5": _R5, "0.0.6": _R6, "0.0.7": _R7, "0.0.8": _R8, "0.0.9": _R9,
-    "tiny": dict(_R1, vocab_size=10000, d_model=1024, n_layers=12, d_ffn=2048, seq_len=256),  # toy config for quick iteration
+    # toy configs for quick iteration
+    "tiny": dict(_R1, vocab_size=10000, d_model=1024, n_layers=8, d_ffn=3072, seq_len=128),
+    "tiny_mbpe": dict(
+        _R1, vocab_size=32768, tokenizer_kind="multilingual_bpe",
+        enable_dual_head=True, enable_sampled_softmax=True, n_samples=1024,
+        d_model=1024, n_layers=8, d_ffn=3072, seq_len=128,
+    ),
 }
 
 DEFAULT_VERSION = "0.0.0"

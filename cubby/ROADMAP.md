@@ -68,7 +68,7 @@ and train on the Vulkan backend, not CUDA/DirectML.
 - [x] real tokenizer wired: BBPE-65k v3 loads + trains; spelling garble gone vs byte
 - [x] ternary vs SwiGLU A/B: quality parity (1.225 vs 1.231) -- byte savings ~free (small scale)
 - [ ] ternary Vulkan kernel (multiply-free): cpp/src/ops + shader + binding (the actual byte/speed win)
-- [ ] AST/cubelang special tokens registered on BBPE-65k (NL ids unchanged)
+- [ ] AST/cubelang special tokens registered on BBPE-65k (NL ids unchanged) -- SUPERSEDED by multilingual BPE below
 - [x] 0.0.1 GPU linear bridge: tape `linear` over `_bridge.linear`/`linear_backward` (all tests green, parity 2.8e-7)
 - [x] 0.0.1 trains on GPU beyond CPU's reach (d=512 L8); FINDING: transfer-bound, ~0.6 it/s
 - [x] 0.0.1 perf diagnosis: cost is per-dispatch overhead (~25ms/call), not compute/transfer (silu-fusion + fp16 both null)
@@ -76,3 +76,41 @@ and train on the Vulkan backend, not CUDA/DirectML.
 - [x] 0.0.1 perf #3 GPU CE (softmax/loss on GPU; _bridge.ce_backward rejected as wrong) + in-place AdamW (293ms vs 489; GPU adamw rejected)
 - [ ] 0.0.1 perf #2 resident activations (VRAM across forward; the ~25ms/dispatch floor) -- big refactor, needs arch decision
 - [ ] 0.0.1 full v3.3 shape (d=1024 L18 V65k) run once throughput is acceptable
+
+## Architecture milestone: multilingual BPE + sampled softmax + dual-head (June 2026)
+
+Replaces BBPE-65k + full softmax CE with a three-part architecture change:
+
+1. **Custom multilingual BPE** (`cubby_mbpe32k`, 32768 vocab). Trained on 128 GB
+   of the unified corpus (C4 multilingual, wiki EN/FR, math, agent data, personas)
+   using the Rust `tokenizers` crate. Byte-level with Split pre-tokenizer. 67
+   special tokens registered as atomic `AddedToken` entries (chat markers, AST
+   structure tags, CubeLang VM opcodes). 47 of those are classified as AST tokens;
+   the remaining are language-adjacent (chat/structural). Roundtrip validated
+   across 7 scripts (EN/FR/ZH/RU/AR/HI/JA).
+
+2. **Dual-head output architecture**. Single shared trunk; learned router
+   (`Linear(d, 2) -> softmax`) per token position gates two independent heads:
+   - Language head: `RMSNorm -> Linear(h, embed_lang)` -> logits (V_lang)
+   - AST head: `RMSNorm -> Linear(h, embed_ast)` -> logits (V_ast)
+   Tokens classified as lang vs AST by membership in `tok.ast_token_ids`.
+   Loss = router-weighted sum of per-head CE. Gated OFF by default
+   (`enable_dual_head=False`); enabled in `tiny_mbpe` preset.
+
+3. **Sampled softmax / importance-sampling CE** (`sampled_cross_entropy`).
+   Avoids materialising the full (N, V) logit tensor during training: for each
+   token, draw K=1024 uniform negatives, compute logits only for the K+1 subset
+   (target + negatives), CE over the subset. With uniform sampling the IS
+   correction is a constant -> gradient direction unbiased (Bengio & Senecal 2008).
+   At inference, full softmax is used (cheap at 30k vocab). Custom GradFn with
+   correct sparse gradient scatter-add into the embedding table.
+
+Files changed: `cubby/tools/train_tokenizer.py` (new), `cubby/tokenizer.py`,
+`cubby/config.py`, `cubby/trunk/model.py`, `cubby/trunk/resident.py`, `main.py`.
+
+**✅ Gate passed (June 2026):** `tiny_mbpe` preset trains to PPL 27-42 @ step 400,
+generates coherent English prose ("Once upon a time, there was a girl named Lily.
+She loved to look around..."), stable gradients (gnorm 0.6-0.74), 1.59 it/s.
+Sampled softmax working as designed — no full (N, 32721) logit tensor. Checkpoint
+saved at `ckpt_tiny_mbpe.grl`. Next: port dual-head + sampled IS to resident GPU
+path for full v3.3-shape training.

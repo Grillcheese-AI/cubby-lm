@@ -1,17 +1,26 @@
 """Tokenizers for Cubby.
 
-- ByteTokenizer : vocab 256, the validated control (no deps); assembles words
-  byte-by-byte, so small/short runs produce phonetic misspellings.
-- BPETokenizer  : wraps a HuggingFace `tokenizers` JSON -- the production
-  BBPE-65k v3 artifact. Each id is a wordpiece, so generation emits valid
-  fragments (no intra-word garble); errors become word-choice/grammar, not
-  spelling. This is the tokenizer the ladder targets (+ AST special tokens later).
+- ByteTokenizer      : vocab 256, the validated control (no deps); assembles words
+                       byte-by-byte, so small/short runs produce phonetic misspellings.
+- BPETokenizer       : wraps a HuggingFace `tokenizers` JSON -- the production
+                       BBPE-65k v3 artifact. Each id is a wordpiece, so generation
+                       emits valid fragments (no intra-word garble); errors become
+                       word-choice/grammar, not spelling.
+- MultilingualBPE    : our custom byte-level multilingual BPE, trained on the
+                       unified corpus (C4 multilingual, Wiki EN/FR, math, agent data).
+                       ~32k vocab with AST/CubeLang special tokens registered as
+                       atomic entries so they never fragment.
 
 Uniform interface: .encode(text)->list[int], .decode(ids)->str, .vocab_size.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 BBPE65K_PATH = r"E:\AITEMP\grillcheese_bbpe65k_v3.json"
+# default path for the multilingual BPE artifact (built by cubby/tools/train_tokenizer.py)
+_MultilingualBPE_DIR = Path(__file__).parent / "tokenizers" / "cubby_mbpe32k"
+MultilingualBPE_PATH = _MultilingualBPE_DIR / "tokenizer.json"
 
 
 class ByteTokenizer:
@@ -39,6 +48,73 @@ class BPETokenizer:
 
     def decode(self, ids):
         return self.tok.decode([int(i) for i in ids])
+
+
+class MultilingualBPE:
+    """Custom byte-level multilingual BPE (~32k vocab).
+
+    Loaded from a HuggingFace tokenizer.json artifact (our own, built by
+    cubby/tools/train_tokenizer.py on the unified training corpus). AST/CubeLang
+    special tokens are registered as atomic entries so the language head and the
+    AST head see disjoint, non-overlapping IDs — the AST region is the tail end
+    of the vocab, starting at `ast_start_id`.
+    """
+    kind = "multilingual_bpe"
+
+    def __init__(self, path: str | Path | None = None):
+        from tokenizers import Tokenizer, AddedToken
+        path = path or MultilingualBPE_PATH
+        self.tok = Tokenizer.from_file(str(path))
+        self.vocab_size = self.tok.get_vocab_size()
+        self.path = str(path)
+        # scan added tokens
+        added = self.tok.get_added_tokens_decoder()
+        self._added_tokens = {id_: tok.content for id_, tok in added.items()}
+        self._name_to_id = {tok.content: id_ for id_, tok in added.items()}
+        self.n_special_tokens = len(self._added_tokens)
+        # AST tokens: CubeLang opcodes + AST structure tags. These are a small,
+        # explicit set — NOT a range, since special tokens are interleaved with
+        # chat/structural markers at the front of the vocab.
+        _ast_exact = {
+            # CubeLang VM opcodes
+            "BIND_ROLE", "UNBIND_ROLE", "REBIND_ROLE",
+            "MATCH", "PREDICT", "DISCOVER",
+            "ANALOGY", "TEMPORAL_BIND", "UNIFY",
+            "SUM", "SELECT", "GROUP", "SORT", "JOIN",
+            "MERGE", "SPLIT", "FILTER", "MAP_ROLES", "REDUCE",
+            "INST", "GEN", "NEWVAR", "SKIP",
+            "BIND", "UNBIND", "QUERY",
+            # AST structure tags
+            "<OPCODE>", "</OPCODE>",
+            "<TASK:SCHEMA2RULE>",
+            "<SCHEMA>", "</SCHEMA>",
+            "<ROLES>", "</ROLES>",
+            "<TRACE>", "</TRACE>",
+            "<RULE>", "</RULE>",
+            "<VALID>", "</VALID>",
+            # agent/domain concepts used in AST framing
+            "AGENT", "ACTION", "OBJECT", "QUANTITY",
+            "SOURCE", "DESTINATION", "CONTEXT", "STATE",
+        }
+        self.ast_token_ids = frozenset(
+            id_ for id_, content in self._added_tokens.items()
+            if content in _ast_exact
+        )
+        self.n_ast_tokens = len(self.ast_token_ids)
+        # language vocab = everything not in ast_token_ids (most of the 32k BPE)
+        self.lang_vocab_size = self.vocab_size - self.n_ast_tokens
+
+    def encode(self, text: str) -> list[int]:
+        return self.tok.encode(text).ids
+
+    def decode(self, ids) -> str:
+        return self.tok.decode([int(i) for i in ids])
+
+    def is_ast_token(self, token_id: int) -> bool:
+        return int(token_id) in self.ast_token_ids
+
+    def token_name(self, token_id: int) -> str | None:
+        return self._added_tokens.get(int(token_id))
 
 
 class RemapTokenizer:
@@ -81,4 +157,6 @@ def make_tokenizer(kind: str = "byte", path: str | None = None):
         return ByteTokenizer()
     if kind in ("bpe", "bbpe65k"):
         return BPETokenizer(path or BBPE65K_PATH)
+    if kind in ("multilingual_bpe", "mbpe", "mbpe32k"):
+        return MultilingualBPE(path)
     raise ValueError(f"unknown tokenizer kind {kind!r}")

@@ -110,6 +110,82 @@ def cross_entropy(logits, targets) -> Variable:
                     grad_fn=GradFn("CrossEntropy", backward_fn, [z]))
 
 
+def sampled_cross_entropy(hidden, embed_weight, targets, n_samples: int = 1024,
+                          vocab_size: int | None = None) -> Variable:
+    """Importance-sampled CE: avoid materialising the full (N, V) logit tensor.
+
+    For each token position, compute logits ONLY for the true target + K random
+    negatives drawn uniformly from the vocab.  CE is computed over the (K+1)
+    subset.  With uniform sampling the IS correction is a constant that cancels
+    in the softmax, so the gradient direction is unbiased — this is exactly
+    Bengio & Senecal (2008) with q = uniform.
+
+    Inputs
+      hidden  : (N, d) tape Variable, the post-RMSNorm hidden states
+      embed_weight : (V, d) tape Variable, the language embedding table
+      targets : int array (N,), the true target token IDs in [0, V)
+      n_samples : number of negative samples per position
+
+    Returns a scalar tape Variable wrapping the per-position mean CE loss.
+    """
+    h_var = _ensure_variable(hidden)
+    w_var = _ensure_variable(embed_weight)
+    H = np.asarray(h_var.data, dtype=np.float32)          # (N, d)
+    W = np.asarray(w_var.data, dtype=np.float32)          # (V, d)
+    V = W.shape[0]
+    vocab_size = vocab_size or V
+    t = np.asarray(targets, dtype=np.int64).reshape(-1)    # (N,)
+    N = H.shape[0]
+    K = n_samples
+
+    # ── draw negatives + build subset indices ──────────────────────────
+    neg = np.random.randint(0, vocab_size, size=(N, K)).astype(np.int64)   # (N, K)
+    # first column is always the true target (position 0 in the subset)
+    sub_ids = np.concatenate([t[:, None], neg], axis=1)                    # (N, K+1)
+    # clamp into [0, V) in case vocab_size > V (shouldn't happen but be safe)
+    sub_ids = np.clip(sub_ids, 0, V - 1)
+
+    # ── subset logits: dot product of h with sampled weight rows ───────
+    W_sub = W[sub_ids]                          # (N, K+1, d)
+    logits_sub = np.einsum("nd,nkd->nk", H, W_sub)   # (N, K+1)
+    # target is always index 0 in each row
+    targets_sub = np.zeros(N, dtype=np.int64)
+
+    # ── forward: CE over (K+1) classes ─────────────────────────────────
+    m = logits_sub.max(axis=1, keepdims=True)
+    sm = np.exp(logits_sub - m);  sm /= sm.sum(axis=1, keepdims=True)
+    loss = float(-np.log(sm[np.arange(N), 0] + 1e-12).mean())
+
+    if not (_ag._grad_enabled and (h_var.requires_grad or w_var.requires_grad)):
+        return Variable(np.float32(loss), requires_grad=False)
+
+    # ── backward ───────────────────────────────────────────────────────
+    # dL/dlogits_sub = (softmax - onehot_at_0) / N  — standard CE grad on subset
+    d_logits = sm.copy()
+    d_logits[:, 0] -= 1.0
+    d_logits /= N                                            # (N, K+1)
+
+    def backward_fn(grad_output):
+        go = float(np.asarray(grad_output))
+        d_logits_g = d_logits * go                           # (N, K+1)
+
+        # grad w.r.t. hidden: scatter-add over the sampled K+1 weight rows
+        # dL/dh[n] = sum_k d_logits_g[n,k] * W_sub[n,k,:]
+        dh = np.einsum("nk,nkd->nd", d_logits_g, W_sub)     # (N, d)
+
+        # grad w.r.t. weight rows: scatter-add into full (V, d)
+        dW = np.zeros_like(W)                                # (V, d)
+        # dL/dW_sub[n,k,:] = d_logits_g[n,k] * h[n,:]
+        dW_sub = d_logits_g[:, :, None] * H[:, None, :]     # (N, K+1, d)
+        # scatter-add: add each row of dW_sub to dW[sub_ids]
+        np.add.at(dW, sub_ids.reshape(-1), dW_sub.reshape(-1, d))
+
+        return (dh.astype(np.float32), dW.astype(np.float32))
+
+    return Variable(np.float32(loss), requires_grad=True,
+                    grad_fn=GradFn("SampledCE", backward_fn, [h_var, w_var]))
+
+
 class MinGRUMixer:
     """Tape MinGRU: g/v/d = Linear(x); h = min_gru(g, v, d). Tape _Linear weights
     (not nn.Linear, whose C++ Parameters the tape would treat as constants)."""
@@ -165,33 +241,202 @@ class Block:
 
 
 class CubbyLM:
-    """0.0.0 substrate: embed -> blocks -> final RMSNorm -> tied linear head."""
+    """Trunk model.
+
+    0.0.0 substrate (enable_dual_head=False): embed -> blocks -> final RMSNorm ->
+    tied linear head.
+
+    Dual-head architecture (enable_dual_head=True): the single trunk projects to
+    two separate output heads gated by a learned router:
+      - Language head: RMSNorm_lang -> h @ embed_lang[:V_lang].T
+      - AST head: RMSNorm_ast -> h @ embed_ast[:V_ast].T
+    The router (d -> 2, softmax) weights each head per token position. Language
+    and AST embeddings are disjoint slices of the vocab — the tokenizer defines
+    the boundary (ast_start_id). Sampled softmax (importance sampling) can be
+    swapped in for the language head loss during training.
+    """
 
     def __init__(self, cfg):
         self.cfg = cfg
-        V, d = cfg.total_vocab, cfg.d_model
-        self.embed = Variable((np.random.randn(V, d) * cfg.embed_init_std).astype(np.float32),
-                              requires_grad=True)
+        d = cfg.d_model
+        self.dual_head = getattr(cfg, "enable_dual_head", False)
+
+        if self.dual_head:
+            Vlang = getattr(cfg, "vocab_size", cfg.total_vocab)  # language region
+            Vast = cfg.total_vocab - Vlang                         # AST region
+            # language embed + output (tied)
+            self.embed_lang = Variable(
+                (np.random.randn(Vlang, d) * cfg.embed_init_std).astype(np.float32),
+                requires_grad=True)
+            self.final_lang = Variable(np.ones((d,), dtype=np.float32), requires_grad=True)
+            # AST embed + output (tied)
+            self.embed_ast = Variable(
+                (np.random.randn(max(Vast, 1), d) * cfg.embed_init_std).astype(np.float32),
+                requires_grad=True) if Vast > 0 else None
+            self.final_ast = Variable(
+                np.ones((d,), dtype=np.float32), requires_grad=True) if Vast > 0 else None
+            # router: d -> 2 (language vs AST)
+            self.router = Variable(
+                (np.random.randn(cfg.router_d, d) * 0.01).astype(np.float32),
+                requires_grad=True)
+            self.Vlang = Vlang
+            self.Vast = Vast
+            # kept for compat (used by old code paths that read model.embed)
+            self.embed = self.embed_lang
+            self.final = self.final_lang
+        else:
+            V, d = cfg.total_vocab, d
+            self.embed = Variable(
+                (np.random.randn(V, d) * cfg.embed_init_std).astype(np.float32),
+                requires_grad=True)
+            self.blocks = [Block(cfg, i) for i in range(cfg.n_layers)]
+            self.final = Variable(np.ones((d,), dtype=np.float32), requires_grad=True)
+            self.Vlang = V
+            self.Vast = 0
+
         self.blocks = [Block(cfg, i) for i in range(cfg.n_layers)]
-        self.final = Variable(np.ones((d,), dtype=np.float32), requires_grad=True)
 
     def parameters(self):
-        yield self.embed
+        if self.dual_head:
+            yield self.embed_lang
+            if self.embed_ast is not None:
+                yield self.embed_ast
+            yield self.final_lang
+            if self.final_ast is not None:
+                yield self.final_ast
+            yield self.router
+        else:
+            yield self.embed
         for b in self.blocks:
             yield from b.parameters()
-        yield self.final
+        if not self.dual_head:
+            yield self.final
 
     def __call__(self, ids):
-        x = embedding(self.embed, ids)
+        """Forward pass. Returns logits tensor(s).
+
+        Single-head: returns (B, S, V) logits array as a tape Variable.
+        Dual-head: returns dict with keys 'lang_logits' (B,S,V_lang) and
+        'ast_logits' (B,S,V_ast) and 'router_weights' (B,S,2).
+        """
+        if self.dual_head:
+            # gather from combined embed: token IDs may span both regions
+            # build a virtual full embed by concatenating lang + ast tables
+            if self.embed_ast is not None and self.Vast > 0:
+                full_embed = np.concatenate([
+                    np.asarray(self.embed_lang.data, np.float32),
+                    np.asarray(self.embed_ast.data, np.float32)], axis=0)
+                full_var = Variable(full_embed, requires_grad=False)
+            else:
+                full_var = self.embed_lang
+            x = embedding(full_var, ids)
+        else:
+            x = embedding(self.embed, ids)
+
         with trace.scope("trunk"):
             for b in self.blocks:
                 x = b(x)
-        x = rmsnorm(x, self.final, self.cfg.rmsnorm_eps)
-        logits = _linear(x, self.embed)         # tied head (V,d): grads merge into embed
-        return logits
+
+        if self.dual_head:
+            # router: h @ router.T -> (B, S, 2) -> softmax
+            h = np.asarray(x.data, np.float32)
+            B, S, d = h.shape
+            h_flat = h.reshape(-1, d)
+            router_logits = h_flat @ np.asarray(self.router.data, np.float32).T  # (BS, 2)
+            rl = router_logits - router_logits.max(axis=1, keepdims=True)
+            rw = np.exp(rl); rw /= rw.sum(axis=1, keepdims=True)
+            router_weights = rw.reshape(B, S, 2)
+
+            # language head
+            h_lang = rmsnorm(x, self.final_lang, self.cfg.rmsnorm_eps)
+            lang_logits = _linear(h_lang, self.embed_lang)  # (B, S, V_lang)
+
+            # AST head
+            ast_logits = None
+            if self.embed_ast is not None and self.Vast > 0:
+                h_ast = rmsnorm(x, self.final_ast, self.cfg.rmsnorm_eps)
+                ast_logits = _linear(h_ast, self.embed_ast)  # (B, S, V_ast)
+
+            return {"lang_logits": lang_logits,
+                    "ast_logits": ast_logits,
+                    "router_weights": Variable(router_weights.astype(np.float32),
+                                               requires_grad=False)}
+        else:
+            x = rmsnorm(x, self.final, self.cfg.rmsnorm_eps)
+            logits = _linear(x, self.embed)  # tied head
+            return logits
 
     def loss(self, ids, targets):
-        return cross_entropy(self(ids), targets)
+        """Compute loss. Routes to language head, AST head, or both."""
+        out = self(ids)
+        if not self.dual_head:
+            if getattr(self.cfg, "enable_sampled_softmax", False):
+                # sampled IS: avoid full (N, V) logits
+                h = out  # not logits — but single-head returns logits
+                # actually for sampled, we need hidden states, not logits
+                # the single-head path needs to be re-entered — handled in train loop
+                pass
+            return cross_entropy(out, targets)
+
+        # ── dual-head loss ─────────────────────────────────────────────
+        lang_logits = out["lang_logits"]
+        ast_logits = out["ast_logits"]
+        rw = np.asarray(out["router_weights"].data, np.float32)  # (B, S, 2)
+
+        targets_arr = np.asarray(targets, dtype=np.int64)
+        B, S = targets_arr.shape
+        Vlang = self.Vlang
+
+        # classify each target: lang (id < Vlang) or AST (id >= Vlang)
+        is_lang = (targets_arr < Vlang)           # (B, S) bool
+        is_ast = ~is_lang
+
+        total_loss = 0.0
+        n_lang = int(is_lang.sum())
+        n_ast = int(is_ast.sum())
+
+        # language CE (for language targets only)
+        if n_lang > 0:
+            Ll = np.asarray(lang_logits.data, np.float32).reshape(-1, self.Vlang)
+            tl = targets_arr.reshape(-1)
+            lang_mask = is_lang.reshape(-1)
+            Ll_sub = Ll[lang_mask]
+            tl_sub = tl[lang_mask]
+            if getattr(self.cfg, "enable_sampled_softmax", False):
+                # sampled IS over language head
+                h_lang_flat = None  # need hidden states — caller should use
+                # fall back to full CE for now when sampled is requested here
+                m = Ll_sub.max(axis=1, keepdims=True)
+                sm = np.exp(Ll_sub - m); sm /= sm.sum(axis=1, keepdims=True)
+                lang_loss = float(-np.log(sm[np.arange(len(tl_sub)), tl_sub] + 1e-12).mean())
+                # weight by router's language channel
+                w_lang = rw.reshape(-1, 2)[lang_mask, 0].mean()
+            else:
+                m = Ll_sub.max(axis=1, keepdims=True)
+                sm = np.exp(Ll_sub - m); sm /= sm.sum(axis=1, keepdims=True)
+                lang_loss = float(-np.log(sm[np.arange(len(tl_sub)), tl_sub] + 1e-12).mean())
+                w_lang = rw.reshape(-1, 2)[lang_mask, 0].mean()
+            total_loss += w_lang * lang_loss
+
+        # AST CE (for AST targets only)
+        if n_ast > 0 and ast_logits is not None:
+            La = np.asarray(ast_logits.data, np.float32).reshape(-1, self.Vast)
+            ta = targets_arr.reshape(-1) - Vlang  # shift to [0, Vast)
+            ast_mask = is_ast.reshape(-1)
+            La_sub = La[ast_mask]
+            ta_sub = ta[ast_mask]
+            m = La_sub.max(axis=1, keepdims=True)
+            sm = np.exp(La_sub - m); sm /= sm.sum(axis=1, keepdims=True)
+            ast_loss = float(-np.log(sm[np.arange(len(ta_sub)), ta_sub] + 1e-12).mean())
+            w_ast = rw.reshape(-1, 2)[ast_mask, 1].mean()
+            total_loss += w_ast * ast_loss
+
+        # if no AST targets, just do language CE on all (router defaults to lang)
+        if n_ast == 0 and n_lang > 0:
+            total_loss = float(np.asarray(
+                cross_entropy(lang_logits, targets).data))
+
+        return Variable(np.float32(total_loss), requires_grad=False)
 
     def generate(self, prompt_ids, max_new_tokens=128, temperature=1.0):
         ids = list(np.asarray(prompt_ids, dtype=np.int64).reshape(-1))

@@ -407,10 +407,13 @@ def train_cubby_resident(version="0.0.0", steps=600, data="tinystory_50k.json",
                          B=8, S=64, lr=3e-4, max_tokens=4000000, sample_every=200,
                          prompt="Once upon a time", gen_tokens=60, dev=None,
                          warmup=0, max_grad_norm=1.0,
-                         ckpt_path=None, ckpt_every=100, resume=True, max_consec_skips=10):
+                         ckpt_path=None, ckpt_every=100, resume=True, max_consec_skips=10,
+                         tokenizer="bbpe65k"):
     """Train a CubbyLM via the RESIDENT backend (persistent weights + resident
-    AdamW + E host path) on a BBPE-65k stream; sample periodically. The default
-    `main.py train` backend. Returns (ResidentTrunk, tokenizer)."""
+    AdamW + E host path); sample periodically. The default `main.py train`
+    backend. `tokenizer` selects the tokenizer: "bbpe65k" (default), "multilingual_bpe"/
+    "mbpe32k" (our 32k custom BPE + AST tokens), or "byte".
+    Returns (ResidentTrunk, tokenizer)."""
     import json
     import time as _time
     force_numpy_reference()                                 # resident path owns the GPU
@@ -423,7 +426,13 @@ def train_cubby_resident(version="0.0.0", steps=600, data="tinystory_50k.json",
         data = os.path.join(_CUBBY_ROOT, data)             # resolve relative to repo root
     np.random.seed(0)
     cfg = make_config(version)
-    tok = make_tokenizer("bbpe65k")
+    tok = make_tokenizer(tokenizer)
+    # If using multilingual_bpe, the tokenizer knows the language/AST split.
+    # Set config vocab_size = lang_vocab_size and n_special_tokens = n_ast_tokens
+    # so total_vocab = vocab_size + n_special_tokens = full tokenizer vocab.
+    if hasattr(tok, 'lang_vocab_size') and hasattr(tok, 'n_ast_tokens'):
+        cfg.vocab_size = tok.lang_vocab_size
+        cfg.n_special_tokens = tok.n_ast_tokens
     with open(data, "r", encoding="utf-8") as f:
         stories = json.load(f)
     sb = []
@@ -432,16 +441,18 @@ def train_cubby_resident(version="0.0.0", steps=600, data="tinystory_50k.json",
         if len(sb) >= max_tokens:
             break
     sb = sb[:max_tokens]
-    # Model vocab smaller than the BBPE-65k tokenizer (e.g. the 'tiny' preset)?
-    # Compress ids into a dense [0, vocab) space by corpus frequency so targets
-    # never exceed the head -- keeps wordpieces, just renumbers them.
+    # Remap path: model vocab smaller than the tokenizer (e.g. 'tiny' preset
+    # with vocab=10000 on a 65k tokenizer). Compress IDs into dense [0, vocab)
+    # by corpus frequency so targets never exceed the head.
     if cfg.total_vocab < tok.vocab_size:
         from cubby.tokenizer import RemapTokenizer
         tok = RemapTokenizer(tok, cfg.total_vocab, sb)
         sb = tok.encode_base(sb)
         print("[remap] V %d->%d  coverage=%.3f%% (rare ids -> <unk>)"
               % (tok.base.vocab_size, tok.vocab_size, tok.coverage * 100), flush=True)
-    assert tok.vocab_size == cfg.total_vocab, (tok.vocab_size, cfg.total_vocab)
+    # For multilingual_bpe, total_vocab = lang_vocab_size + n_ast_tokens = tok.vocab_size
+    if not hasattr(tok, 'lang_vocab_size'):
+        assert tok.vocab_size == cfg.total_vocab, (tok.vocab_size, cfg.total_vocab)
     stream = np.asarray(sb, dtype=np.int64)
     rng = np.random.default_rng(0)
     def batch():
