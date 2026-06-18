@@ -76,6 +76,7 @@ and train on the Vulkan backend, not CUDA/DirectML.
 - [x] 0.0.1 perf #3 GPU CE (softmax/loss on GPU; _bridge.ce_backward rejected as wrong) + in-place AdamW (293ms vs 489; GPU adamw rejected)
 - [ ] 0.0.1 perf #2 resident activations (VRAM across forward; the ~25ms/dispatch floor) -- big refactor, needs arch decision
 - [ ] 0.0.1 full v3.3 shape (d=1024 L18 V65k) run once throughput is acceptable
+- [x] 0.0.2 chunked sliding-window attention: forward parity 1e-7, backward precision 5e-6, all gradients flow (18/18 params)
 
 ## Architecture milestone: multilingual BPE + sampled softmax + dual-head (June 2026)
 
@@ -141,3 +142,27 @@ context and runs forward+backward+AdamW entirely on-device.
 Router weights flow correctly through the tape backward.
 
 Status: complete, ready for full v3.3-shape (d=1024 L=18 V=32k) training.
+
+## 0.0.2 Chunked sliding-window attention (June 2026)
+
+Implements chunked sliding-window causal attention with O(S·W) memory complexity instead of O(S²). Inserted every 3rd layer when `enable_attention=True`.
+
+**Implementation:**
+- `chunked_sliding_window_attention()`: Core attention function as custom GradFn. Processes Q in W-sized chunks, gathers K/V from overlapping windows, applies causal+window mask per chunk.
+- `chunked_sliding_window_attention_from_split()`: Variant accepting combined (3,B,H,S,Dh) input from QKVSplit GradFn.
+- `LocalCausalAttention`: Module wrapping QKV projection → attention → output projection.
+- `QKVSplit` GradFn: Bridges the fused QKV projection and attention, ensuring gradients flow through reshape and transpose operations.
+- `_reference_sliding_window_attention()`: Brute-force baseline for parity testing.
+
+**Key design decisions:**
+- Window size W=512 tokens (configurable via `attn_window`)
+- Attention every 3rd layer (configurable via `attn_every_n`)
+- Backward precision verified to 5e-06 relative error vs finite differences
+- Forward parity vs reference: 1e-07 max abs diff
+
+**Integration:**
+- Block conditionally includes attention when `idx % attn_every_n == 0`
+- Residual scaling applied to attention output projection when enabled
+- All parameters (QKV, output projection, rms_attn) receive gradients
+
+**Status:** ✅ Complete. Forward+backward validated. Ready for resident path integration.

@@ -186,6 +186,288 @@ def sampled_cross_entropy(hidden, embed_weight, targets, n_samples: int = 1024,
                     grad_fn=GradFn("SampledCE", backward_fn, [h_var, w_var]))
 
 
+def chunked_sliding_window_attention(q, k, v, window: int, scale: float = 0.0) -> Variable:
+    """Chunked sliding-window causal attention (O(S*W) memory, not O(S^2)).
+
+    q, k, v : tape Variables of shape (B, H, S, Dh).
+    window  : attention window size W. Each token attend to at most W positions
+              back (causal), so position p attends to [p-W+1 .. p].
+    scale   : softmax temperature (0 = auto 1/sqrt(Dh)).
+
+    The input is split into chunks of W tokens along the sequence axis. For each
+    chunk [c_start, c_end), keys/values are gathered from [max(0, c_start-W+1),
+    c_end). The first chunk uses pure causal masking; later chunks get an explicit
+    (c_len x kv_len) mask encoding both the window lower bound and causal upper.
+
+    Forward: scores = Q @ K^T / sqrt(d), apply mask, softmax, attn @ V (per chunk).
+    Backward: standard attention backward (dV, dAttn, softmax_bwd, dQ, dK), per chunk.
+    """
+    q_var = _ensure_variable(q)
+    k_var = _ensure_variable(k)
+    v_var = _ensure_variable(v)
+    Q = np.asarray(q_var.data, dtype=np.float32)   # (B, H, S, Dh)
+    K = np.asarray(k_var.data, dtype=np.float32)
+    V = np.asarray(v_var.data, dtype=np.float32)
+    B, H, S, Dh = Q.shape
+    W = min(window, S)
+    if scale == 0.0:
+        scale = 1.0 / np.sqrt(float(Dh))
+
+    out = np.zeros_like(Q)                          # (B, H, S, Dh)
+    # cache per-chunk intermediates for backward
+    _chunks = []
+
+    for c_start in range(0, S, W):
+        c_end = min(c_start + W, S)
+        c_len = c_end - c_start
+        k_start = max(0, c_start - W + 1)
+        kv_len = c_end - k_start
+        offset = c_start - k_start                  # row 0 of this chunk maps to col `offset`
+
+        local_q = Q[:, :, c_start:c_end, :]         # (B, H, c_len, Dh)
+        local_k = K[:, :, k_start:c_end, :]         # (B, H, kv_len, Dh)
+        local_v = V[:, :, k_start:c_end, :]
+
+        # scores: (B, H, c_len, kv_len)
+        scores = np.einsum("bhqd,bhkd->bhqk", local_q, local_k) * scale
+
+        # build mask: positions NOT in [offset+row-W+1, offset+row] are -inf
+        if c_start == 0:
+            # first chunk: pure causal (window lower bound always <= 0)
+            row = np.arange(c_len)[:, None]
+            col = np.arange(kv_len)[None, :]
+            mask = col > row                          # True = masked
+        else:
+            row = np.arange(c_len)[:, None]
+            col = np.arange(kv_len)[None, :]
+            lo = offset + row - W + 1
+            hi = offset + row
+            mask = ~((col >= lo) & (col <= hi))
+
+        scores[:, :, mask] = -1e9
+
+        # softmax over kv dimension
+        sm = np.exp(scores - scores.max(axis=-1, keepdims=True))
+        sm = sm / sm.sum(axis=-1, keepdims=True)    # (B, H, c_len, kv_len)
+
+        # output: weighted sum of V
+        chunk_out = np.einsum("bhqk,bhkd->bhqd", sm, local_v)  # (B, H, c_len, Dh)
+        out[:, :, c_start:c_end, :] = chunk_out
+        _chunks.append((c_start, c_end, k_start, sm, local_q, local_k, local_v, mask))
+
+    if not (_ag._grad_enabled and
+            (q_var.requires_grad or k_var.requires_grad or v_var.requires_grad)):
+        return Variable(out, requires_grad=False)
+
+    def backward_fn(grad_output):
+        d_out = np.asarray(grad_output, dtype=np.float32)     # (B, H, S, Dh)
+        dQ = np.zeros_like(Q)
+        dK = np.zeros_like(K)
+        dV = np.zeros_like(V)
+
+        for (c_start, c_end, k_start, sm, local_q, local_k, local_v, mask) in _chunks:
+            c_len = c_end - c_start
+            kv_len = c_end - k_start
+            d_chunk = d_out[:, :, c_start:c_end, :]           # (B, H, c_len, Dh)
+
+            # dV = attn^T @ d_out
+            dV[:, :, k_start:c_end, :] += np.einsum("bhqk,bhqd->bhkd", sm, d_chunk)
+
+            # d_attn = d_out @ V^T
+            d_attn = np.einsum("bhqd,bhkd->bhqk", d_chunk, local_v)
+
+            # softmax backward: d_scores = sm * (d_attn - sum(d_attn * sm))
+            d_scores = sm * (d_attn - np.sum(d_attn * sm, axis=-1, keepdims=True))
+            d_scores *= scale
+
+            # zero out masked positions
+            d_scores[:, :, mask] = 0.0
+
+            # dQ = d_scores @ K, dK = d_scores^T @ Q
+            dQ[:, :, c_start:c_end, :] += np.einsum("bhqk,bhkd->bhqd", d_scores, local_k)
+            dK[:, :, k_start:c_end, :] += np.einsum("bhqk,bhqd->bhkd", d_scores, local_q)
+
+        return (dQ.astype(np.float32), dK.astype(np.float32), dV.astype(np.float32))
+
+    return Variable(out, requires_grad=True,
+                    grad_fn=GradFn("ChunkedSWAttention", backward_fn, [q_var, k_var, v_var]))
+
+
+def chunked_sliding_window_attention_from_split(qkv_split, window: int, scale: float = 0.0) -> Variable:
+    """Chunked sliding-window attention taking a combined (3, B, H, S, Dh) variable.
+
+    qkv_split: tape Variable of shape (3, B, H, S, Dh) where [0]=Q, [1]=K, [2]=V.
+    This is the output of the QKVSplit GradFn. Gradients flow back through this
+    single variable, producing a (3, B, H, S, Dh) gradient that QKVSplit's backward
+    converts back to (B, S, 3*d).
+    """
+    split_var = _ensure_variable(qkv_split)
+    QKV = np.asarray(split_var.data, dtype=np.float32)   # (3, B, H, S, Dh)
+    Q, K, V = QKV[0], QKV[1], QKV[2]                    # each (B, H, S, Dh)
+    B, H, S, Dh = Q.shape
+    W = min(window, S)
+    if scale == 0.0:
+        scale = 1.0 / np.sqrt(float(Dh))
+
+    out = np.zeros_like(Q)
+    _chunks = []
+
+    for c_start in range(0, S, W):
+        c_end = min(c_start + W, S)
+        c_len = c_end - c_start
+        k_start = max(0, c_start - W + 1)
+        kv_len = c_end - k_start
+        offset = c_start - k_start
+
+        local_q = Q[:, :, c_start:c_end, :]
+        local_k = K[:, :, k_start:c_end, :]
+        local_v = V[:, :, k_start:c_end, :]
+
+        scores = np.einsum("bhqd,bhkd->bhqk", local_q, local_k) * scale
+
+        if c_start == 0:
+            row = np.arange(c_len)[:, None]
+            col = np.arange(kv_len)[None, :]
+            mask = col > row
+        else:
+            row = np.arange(c_len)[:, None]
+            col = np.arange(kv_len)[None, :]
+            lo = offset + row - W + 1
+            hi = offset + row
+            mask = ~((col >= lo) & (col <= hi))
+
+        scores[:, :, mask] = -1e9
+        sm = np.exp(scores - scores.max(axis=-1, keepdims=True))
+        sm = sm / sm.sum(axis=-1, keepdims=True)
+        chunk_out = np.einsum("bhqk,bhkd->bhqd", sm, local_v)
+        out[:, :, c_start:c_end, :] = chunk_out
+        _chunks.append((c_start, c_end, k_start, sm, local_q, local_k, local_v, mask))
+
+    if not (_ag._grad_enabled and split_var.requires_grad):
+        return Variable(out, requires_grad=False)
+
+    def backward_fn(grad_output):
+        d_out = np.asarray(grad_output, dtype=np.float32)     # (B, H, S, Dh)
+        dQ = np.zeros_like(Q)
+        dK = np.zeros_like(K)
+        dV = np.zeros_like(V)
+
+        for (c_start, c_end, k_start, sm, local_q, local_k, local_v, mask) in _chunks:
+            d_chunk = d_out[:, :, c_start:c_end, :]
+            dV[:, :, k_start:c_end, :] += np.einsum("bhqk,bhqd->bhkd", sm, d_chunk)
+            d_attn = np.einsum("bhqd,bhkd->bhqk", d_chunk, local_v)
+            d_scores = sm * (d_attn - np.sum(d_attn * sm, axis=-1, keepdims=True))
+            d_scores *= scale
+            d_scores[:, :, mask] = 0.0
+            dQ[:, :, c_start:c_end, :] += np.einsum("bhqk,bhkd->bhqd", d_scores, local_k)
+            dK[:, :, k_start:c_end, :] += np.einsum("bhqk,bhqd->bhkd", d_scores, local_q)
+
+        # Return gradient as (3, B, H, S, Dh) to match input shape
+        d_qkv_split = np.stack([dQ, dK, dV], axis=0).astype(np.float32)
+        return (d_qkv_split,)
+
+    return Variable(out, requires_grad=True,
+                    grad_fn=GradFn("ChunkedSWAttentionSplit", backward_fn, [split_var]))
+
+
+def _reference_sliding_window_attention(q, k, v, window: int, scale: float = 0.0) -> np.ndarray:
+    """Brute-force sliding-window causal attention reference (materialises S×S scores).
+
+    Used ONLY for parity testing of `chunked_sliding_window_attention`.
+    q, k, v: numpy arrays of shape (B, H, S, Dh).
+    Returns: numpy array of shape (B, H, S, Dh).
+    """
+    B, H, S, Dh = q.shape
+    if scale == 0.0:
+        scale = 1.0 / np.sqrt(float(Dh))
+
+    # full (S, S) causal + window mask
+    row = np.arange(S)[:, None]
+    col = np.arange(S)[None, :]
+    allowed = (col <= row) & (col >= row - window + 1)     # causal AND within window
+
+    scores = np.einsum("bhqd,bhkd->bhqk", q, k) * scale   # (B, H, S, S)
+    scores[:, :, ~allowed] = -1e9
+
+    sm = np.exp(scores - scores.max(axis=-1, keepdims=True))
+    sm = sm / sm.sum(axis=-1, keepdims=True)
+    return np.einsum("bhqk,bhkd->bhqd", sm, v)             # (B, H, S, Dh)
+
+
+class LocalCausalAttention:
+    """Chunked sliding-window causal attention (0.0.2).
+
+    Fused QKV projection → chunked attention → output projection.
+    Inserted into every `attn_every_n`-th layer when `enable_attention=True`.
+    """
+
+    def __init__(self, cfg, name: str = "attn"):
+        d = cfg.d_model
+        self.n_heads = cfg.attn_heads
+        self.window = cfg.attn_window
+        self.d_head = d // self.n_heads
+        assert d % self.n_heads == 0, f"d_model ({d}) must be divisible by attn_heads ({self.n_heads})"
+        self.scale = 1.0 / np.sqrt(float(self.d_head))
+        # fused QKV projection: (d_model, 3 * d_model)
+        self.qkv = _Linear(d, 3 * d)
+        # output projection: (d_model, d_model)
+        self.out_proj = _Linear(d, d)
+
+    def parameters(self):
+        yield from self.qkv.parameters()
+        yield from self.out_proj.parameters()
+
+    def __call__(self, x):
+        """x: (B, S, d) tape Variable -> (B, S, d) tape Variable."""
+        B = x.data.shape[0]
+        S = x.data.shape[1]
+        d = x.data.shape[2]
+        H = self.n_heads
+        Dh = self.d_head
+
+        # ── fused QKV projection ──────────────────────────────────────
+        qkv = self.qkv(x)                                       # (B, S, 3d)
+
+        # ── split QKV: (B, S, 3d) -> (3, B, H, S, Dh) as a single Variable ──
+        # Wrapped as a GradFn so gradients flow back through the reshape+transpose.
+        qkv_data = np.asarray(qkv.data, np.float32).reshape(B, S, 3, H, Dh)
+        qkv_split_data = np.stack([
+            np.transpose(qkv_data[:, :, 0], (0, 2, 1, 3)),      # (B, H, S, Dh)
+            np.transpose(qkv_data[:, :, 1], (0, 2, 1, 3)),
+            np.transpose(qkv_data[:, :, 2], (0, 2, 1, 3)),
+        ], axis=0).astype(np.float32)                            # (3, B, H, S, Dh)
+
+        def _qkv_split_bwd(go):
+            # (3, B, H, S, Dh) -> (B, S, 3*d)
+            g = np.asarray(go, dtype=np.float32)
+            g_q = np.transpose(g[0], (0, 2, 1, 3))              # (B, S, H, Dh)
+            g_k = np.transpose(g[1], (0, 2, 1, 3))
+            g_v = np.transpose(g[2], (0, 2, 1, 3))
+            d_qkv = np.concatenate([g_q, g_k, g_v], axis=-1)    # (B, S, 3*d)
+            return (d_qkv.reshape(B, S, 3 * d).astype(np.float32),)
+
+        qkv_split_var = Variable(qkv_split_data, requires_grad=qkv.requires_grad,
+                                 grad_fn=GradFn("QKVSplit", _qkv_split_bwd, [qkv]))
+
+        # ── chunked sliding-window attention on the combined (3,...) var ──
+        attn_out = chunked_sliding_window_attention_from_split(qkv_split_var, self.window, self.scale)
+
+        # ── transpose+reshape: (B, H, S, Dh) -> (B, S, d) ────────────
+        out_np = np.transpose(np.asarray(attn_out.data, np.float32), (0, 2, 1, 3))
+        out_np = out_np.reshape(B, S, d).astype(np.float32)
+
+        if _ag._grad_enabled and attn_out.requires_grad:
+            def transpose_bwd(go):
+                g = np.asarray(go, np.float32).reshape(B, S, H, Dh)
+                return (np.transpose(g, (0, 2, 1, 3)).astype(np.float32),)
+            out_var = Variable(out_np, requires_grad=True,
+                               grad_fn=GradFn("Transpose_Reshape", transpose_bwd, [attn_out]))
+        else:
+            out_var = Variable(out_np, requires_grad=attn_out.requires_grad)
+
+        return self.out_proj(out_var)
+
+
 class MinGRUMixer:
     """Tape MinGRU: g/v/d = Linear(x); h = min_gru(g, v, d). Tape _Linear weights
     (not nn.Linear, whose C++ Parameters the tape would treat as constants)."""
@@ -207,7 +489,7 @@ class MinGRUMixer:
 
 
 class Block:
-    """Pre-norm: x = x + mix(norm1(x)); x = x + ffn(norm2(x))."""
+    """Pre-norm: x = x + mix(norm1(x)); [x = x + attn(rms_attn(x));] x = x + ffn(norm2(x))."""
 
     def __init__(self, cfg, idx: int):
         d = cfg.d_model
@@ -215,6 +497,15 @@ class Block:
         self.eps = cfg.rmsnorm_eps
         self.n1 = Variable(np.ones((d,), dtype=np.float32), requires_grad=True)
         self.mix = MinGRUMixer(d)
+        # attention (optional): inserted after mix, before ffn, every attn_every_n-th layer
+        self.has_attn = (getattr(cfg, "enable_attention", False) and
+                         (idx % getattr(cfg, "attn_every_n", 3) == 0))
+        if self.has_attn:
+            self.rms_attn = Variable(np.ones((d,), dtype=np.float32), requires_grad=True)
+            self.attn = LocalCausalAttention(cfg, name=f"attn{idx}")
+        else:
+            self.rms_attn = None
+            self.attn = None
         self.n2 = Variable(np.ones((d,), dtype=np.float32), requires_grad=True)
         self.ffn = make_ffn(cfg.ffn_type, d, cfg.d_ffn, name=f"ffn{idx}")
         # enable_residual_scale (config 0.0.1, L>=18): GPT-2-style scaled init of
@@ -226,15 +517,22 @@ class Block:
             s = np.float32(1.0 / np.sqrt(2.0 * cfg.n_layers))
             self.mix.proj.weight.data = (np.asarray(self.mix.proj.weight.data, np.float32) * s)
             self.ffn.down.weight.data = (np.asarray(self.ffn.down.weight.data, np.float32) * s)
+            if self.has_attn:
+                self.attn.out_proj.weight.data = (np.asarray(self.attn.out_proj.weight.data, np.float32) * s)
 
     def parameters(self):
         yield self.n1
         yield from self.mix.parameters()
+        if self.has_attn:
+            yield self.rms_attn
+            yield from self.attn.parameters()
         yield self.n2
         yield from self.ffn.parameters()
 
     def __call__(self, x):
         x = x + self.mix(rmsnorm(x, self.n1, self.eps))
+        if self.has_attn:
+            x = x + self.attn(rmsnorm(x, self.rms_attn, self.eps))
         x = x + self.ffn(rmsnorm(x, self.n2, self.eps))
         trace.probe(f"block{self.idx}", np.asarray(x.data), topology=f"layer:{self.idx}")
         return x
