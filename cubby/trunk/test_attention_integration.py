@@ -1,4 +1,8 @@
 """Integration test: full model with attention enabled (0.0.2 config)."""
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
 import numpy as np
 from cubby.config import make_config
 from cubby.trunk.model import CubbyLM

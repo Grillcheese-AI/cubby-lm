@@ -137,7 +137,7 @@ class ResidentTrunk:
         # Attention config
         self.has_attn = bool(getattr(cfg, 'enable_attention', False))
         self.attn_every_n = int(getattr(cfg, 'attn_every_n', 3)) if self.has_attn else 0
-        self.attn_n_heads = int(getattr(cfg, 'attn_n_heads', 8))
+        self.attn_n_heads = int(getattr(cfg, 'attn_heads', getattr(cfg, 'attn_n_heads', 8)))
         self.attn_window = int(getattr(cfg, 'attn_window', 1024))
         self.attn_d_head = self.d // self.attn_n_heads
 
@@ -158,9 +158,11 @@ class ResidentTrunk:
                 layer['out_proj'] = regw(b.attn.out_proj.weight.data) # (d, d)
             self.layers.append(layer)
         # flat list for the optimizer sweep + GPU grad-norm (E included)
-        head_weights = [self.E, self.final] + ([self.router] if self.router is not None else [])
-        # Attention weights are included per-layer when present; use the layer
-        # keys list for non-attention weights, plus per-layer attention keys
+        head_weights = [self.E, self.final]
+        # Router is not in the tape backward graph (loss weighting is done in
+        # numpy), so it doesn't get a gradient from t.backward(). We exclude
+        # it from self.opt to avoid the sum_squares crash. Router weights
+        # will be updated separately if needed.
         layer_weights = []
         for li in range(self.L):
             for k in self._WKEYS:
@@ -596,27 +598,35 @@ def _dual_head_ce(logits, tgt, router_logits, Vlang, Vast,
     is_lang = (tgt < Vlang)
     is_ast = (tgt >= Vlang)
     
-    # Language head loss
+    # Language head loss — only for language tokens (id < Vlang)
     lang_logits = logits[:, :Vlang]  # (BS, Vlang)
-    if use_sampled:
-        lang_loss = _sampled_ce(lang_logits, tgt, Vlang, n_samples=n_samples, d=d_model)
+    n_lang = int(is_lang.sum())
+    if n_lang > 0:
+        lang_mask = is_lang
+        if use_sampled:
+            lang_loss = _sampled_ce(lang_logits[lang_mask], tgt[lang_mask], Vlang,
+                                    n_samples=n_samples, d=d_model)
+        else:
+            lang_loss = _ce(lang_logits[lang_mask], tgt[lang_mask])
     else:
-        lang_loss = _ce(lang_logits, tgt)
+        lang_loss = 0.0
     
     # Weight language loss by mean router weight for language (channel 0)
     w_lang = rw[:, 0].mean()
     lang_weighted = w_lang * lang_loss
     
-    # AST head loss (only for AST tokens)
+    # AST head loss — only for AST tokens (id >= Vlang)
     ast_loss = 0.0
-    n_ast = is_ast.sum()
+    n_ast = int(is_ast.sum())
     if n_ast > 0 and Vast > 0:
         ast_logits = logits[:, Vlang:]  # (BS, Vast)
-        ast_tgt = tgt - Vlang  # shift to [0, Vast)
+        ast_tgt = tgt[is_ast] - Vlang  # shift to [0, Vast)
+        ast_logits_sub = ast_logits[is_ast]
         if use_sampled:
-            ast_loss = _sampled_ce(ast_logits, ast_tgt, Vast, n_samples=n_samples, d=d_model)
+            ast_loss = _sampled_ce(ast_logits_sub, ast_tgt, Vast,
+                                   n_samples=min(n_samples, Vast), d=d_model)
         else:
-            ast_loss = _ce(ast_logits, ast_tgt)
+            ast_loss = _ce(ast_logits_sub, ast_tgt)
     
     # Weight AST loss by mean router weight for AST (channel 1)
     w_ast = rw[:, 1].mean()
