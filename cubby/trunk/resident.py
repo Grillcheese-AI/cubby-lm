@@ -105,9 +105,14 @@ class ResidentTrunk:
         train_step (embedding_scatter_add), so E joins self.opt with no host path.
 
         Dual-head: register combined embedding E_combined = [E_lang; E_ast] as
-        a single resident weight, plus router (d -> 2) as a separate weight."""
+        a single resident weight, plus router (d -> 2) as a separate weight.
+
+        Attention: when enable_attention is set, register per-layer rms_attn,
+        qkv (d->3d fused), and out_proj (d->d) weights. has_attn flags which
+        layers include attention (every attn_every_n-th from block 0)."""
         t, d, dff = self.t, self.d, self.dff
         m = self.model
+        cfg = getattr(m, 'cfg', None)
 
         def regw(arr):
             a = _f32(arr)
@@ -128,22 +133,55 @@ class ResidentTrunk:
             self.E = regw(m.embed.data)                                  # (V, d) tied, resident
             self.router = None
         self.final = regw(m.final.data)
+
+        # Attention config
+        self.has_attn = bool(getattr(cfg, 'enable_attention', False))
+        self.attn_every_n = int(getattr(cfg, 'attn_every_n', 3)) if self.has_attn else 0
+        self.attn_n_heads = int(getattr(cfg, 'attn_n_heads', 8))
+        self.attn_window = int(getattr(cfg, 'attn_window', 1024))
+        self.attn_d_head = self.d // self.attn_n_heads
+
         self.layers = []
-        for b in m.blocks:
+        for li, b in enumerate(m.blocks):
             W = _f32(b.mix.proj.weight.data); gu = _f32(b.ffn.gate_up.weight.data)
-            self.layers.append(dict(
+            layer = dict(
                 n1=regw(b.n1.data), WG=regw(W[0:d]), WV=regw(W[d:2 * d]), WD=regw(W[2 * d:3 * d]),
                 n2=regw(b.n2.data),
                 gate_up=regw(np.concatenate([gu[dff:2 * dff], gu[0:dff]], axis=0)),
                 down=regw(b.ffn.down.weight.data),
-            ))
+                has_attn=False,
+            )
+            if self.has_attn and hasattr(b, 'attn') and getattr(b, 'has_attn', False):
+                layer['has_attn'] = True
+                layer['rms_attn'] = regw(b.rms_attn.data)
+                layer['qkv'] = regw(b.attn.qkv.weight.data)          # (3d, d)
+                layer['out_proj'] = regw(b.attn.out_proj.weight.data) # (d, d)
+            self.layers.append(layer)
         # flat list for the optimizer sweep + GPU grad-norm (E included)
         head_weights = [self.E, self.final] + ([self.router] if self.router is not None else [])
-        self.opt = head_weights + [self.layers[li][k] for li in range(self.L) for k in self._WKEYS]
+        # Attention weights are included per-layer when present; use the layer
+        # keys list for non-attention weights, plus per-layer attention keys
+        layer_weights = []
+        for li in range(self.L):
+            for k in self._WKEYS:
+                layer_weights.append(self.layers[li][k])
+            if self.layers[li].get('has_attn', False):
+                layer_weights.append(self.layers[li]['rms_attn'])
+                layer_weights.append(self.layers[li]['qkv'])
+                layer_weights.append(self.layers[li]['out_proj'])
+        self.opt = head_weights + layer_weights
 
     def _w(self):
+        """Extract weight buffer IDs per layer for the forward pass."""
         w = dict(E=self.E['w'], final=self.final['w'],
-                 layers=[{k: self.layers[li][k]['w'] for k in self._WKEYS} for li in range(self.L)])
+                 layers=[
+                     {**{k: self.layers[li][k]['w'] for k in self._WKEYS},
+                      'has_attn': self.layers[li].get('has_attn', False),
+                      **({'rms_attn': self.layers[li]['rms_attn']['w'],
+                           'qkv': self.layers[li]['qkv']['w'],
+                           'out_proj': self.layers[li]['out_proj']['w']}
+                         if self.layers[li].get('has_attn', False) else {})}
+                     for li in range(self.L)])
         if self.router is not None:
             w['router'] = self.router['w']
         return w
@@ -175,8 +213,10 @@ class ResidentTrunk:
         Returns grads in model.py layout (see _read_grads)."""
         t = self.t; t.begin()
         w = self._w()
+        attn_H = self.attn_n_heads if self.has_attn else 0
         emb, logits_np, BS, _, _, _, _, _ = _fb_run(
-            t, w, ids, targets, self.d, self.dff, self.V, self.L)
+            t, w, ids, targets, self.d, self.dff, self.V, self.L,
+            attn_heads=attn_H, attn_window=self.attn_window)
         return _read_grads(t, w, emb, ids, BS, self.d, self.dff, self.V, self.L)
 
     # --- one resident training step (fully on-GPU: scatter + norm + AdamW) -------
@@ -201,8 +241,10 @@ class ResidentTrunk:
         w = self._w()
         Vlang = self.Vlang if self.dual_head else None
         Vast = self.Vast if self.dual_head else None
+        attn_H = self.attn_n_heads if self.has_attn else 0
         emb, logits_np, _, router_logits_np, _, _, _, _ = _fb_run(
-            t, w, ids, targets, d, self.dff, V, self.L, Vlang, Vast)
+            t, w, ids, targets, d, self.dff, V, self.L, Vlang, Vast,
+            attn_heads=attn_H, attn_window=self.attn_window)
         tgt = np.asarray(targets, np.int64).reshape(-1)
 
         if self.dual_head and router_logits_np is not None:
@@ -264,16 +306,23 @@ def _register_layer_ids(t, P, d, dff, L, requires_grad=True):
     layers = []
     for li in range(L):
         Wp = _f32(P['proj'][li]); gu = _f32(P['gate_up'][li])
-        layers.append(dict(
+        layer = dict(
             n1=reg(P['n1'][li]), WG=reg(Wp[0:d]), WV=reg(Wp[d:2 * d]), WD=reg(Wp[2 * d:3 * d]),
             n2=reg(P['n2'][li]),
             gate_up=reg(np.concatenate([gu[dff:2 * dff], gu[0:dff]], axis=0)),
             down=reg(P['down'][li]),
-        ))
+            has_attn=P['has_attn'][li],
+        )
+        if layer['has_attn']:
+            layer['rms_attn'] = reg(P['rms_attn'][li])
+            layer['qkv_w'] = reg(P['qkv_w'][li])
+            layer['out_proj_w'] = reg(P['out_proj_w'][li])
+        layers.append(layer)
     return E, final, layers
 
 
-def _resident_forward(t, w, ids, d, dff, V, L):
+def _resident_forward(t, w, ids, d, dff, V, L,
+                      attn_heads=None, attn_window=1024):
     """Resident forward over weight buffer ids w={E,final,layers[,router]}. Caller has
     t.begin(). Returns (emb_id, logits_id, cap, nf_id, B, S, router_logits_id).
     cap[li] holds every intermediate buffer id (n1,G,Vv,D,H,r1,n2,gu,h,ff,r2)
@@ -281,23 +330,45 @@ def _resident_forward(t, w, ids, d, dff, V, L):
     E_id, final_id, layers = w['E'], w['final'], w['layers']
     router_id = w.get('router')
     ids = np.asarray(ids, dtype=np.int64); B, S = ids.shape; BS = B * S
+    H = attn_heads or 1
+    Dh = d // H if attn_heads else d
     ids_u32 = t.register_input_u32(ids.reshape(-1).astype(np.uint32))
     t.forward_begin()
     emb = t.forward_embedding(ids_u32, E_id, B, S, V, d)
     x = emb; cap = []
     for lw in layers:
+        # MinGRU block
         n1 = t.forward_rmsnorm(x, lw['n1'], BS, d)
         G = t.forward_linear(n1, lw['WG'], 0, BS, d, d)
         Vv = t.forward_linear(n1, lw['WV'], 0, BS, d, d)
         D = t.forward_linear(n1, lw['WD'], 0, BS, d, d)
-        H = t.forward_mingru(G, Vv, D, B, S, d)
-        r1 = t.forward_add(x, H, BS * d)
-        n2 = t.forward_rmsnorm(r1, lw['n2'], BS, d)
+        H_min = t.forward_mingru(G, Vv, D, B, S, d)
+        r1 = t.forward_add(x, H_min, BS * d)
+        # Attention block (if this layer has it)
+        if lw.get('has_attn', False):
+            ra_rms = t.forward_rmsnorm(r1, lw['rms_attn'], BS, d)
+            qkv_id = t.forward_linear(ra_rms, lw['qkv'], 0, BS, d, 3 * d)
+            q_id, k_id, v_id = t.forward_qkv_split(qkv_id, B, S, H, Dh)
+            attn_out = t.forward_chunked_attention(q_id, k_id, v_id, B, H, S, Dh, attn_window)
+            bshd = t.forward_transpose_bhsd_bshd(attn_out, B, H, S, Dh)
+            outp = t.forward_linear(bshd, lw['out_proj'], 0, BS, d, d)
+            r_attn = t.forward_add(r1, outp, BS * d)
+            cap.append((n1, G, Vv, D, H_min, r1, ra_rms, qkv_id, q_id, k_id, v_id,
+                        attn_out, bshd, outp, r_attn,
+                        lw['rms_attn'], lw['qkv'], lw['out_proj']))
+            x_pre_ffn = r_attn
+        else:
+            cap.append((n1, G, Vv, D, H_min, r1, None))
+            x_pre_ffn = r1
+        # FFN block
+        n2 = t.forward_rmsnorm(x_pre_ffn, lw['n2'], BS, d)
         gu = t.forward_linear(n2, lw['gate_up'], 0, BS, d, 2 * dff)
         h = t.forward_swiglu(gu, BS, dff)
         ff = t.forward_linear(h, lw['down'], 0, BS, dff, d)
-        r2 = t.forward_add(r1, ff, BS * d)
-        cap.append((n1, G, Vv, D, H, r1, n2, gu, h, ff, r2)); x = r2
+        r2 = t.forward_add(x_pre_ffn, ff, BS * d)
+        # store FFN intermediates at the end of cap tuple for both attn/non-attn
+        cap[-1] = cap[-1] + (n2, gu, h, ff, r2)
+        x = r2
     nf = t.forward_rmsnorm(x, final_id, BS, d)
     logits = t.forward_linear(nf, E_id, 0, BS, d, V)
     router_logits_id = None
@@ -307,12 +378,14 @@ def _resident_forward(t, w, ids, d, dff, V, L):
     return emb, logits, cap, nf, B, S, router_logits_id
 
 
-def _fb_run(t, w, ids, targets, d, dff, V, L, Vlang=None, Vast=None):
+def _fb_run(t, w, ids, targets, d, dff, V, L, Vlang=None, Vast=None,
+            attn_heads=0, attn_window=0):
     """Resident forward + backward (records the matching graph, one backward()).
     Returns (emb_id, logits_numpy, BS, router_logits_np, nf_id, logits_id, Vlang, Vast).
     Grad buffers are then readable via t.get_grad_buffer(weight_id) / get_grad_buffer(emb_id).
     Vlang/Vast partition the combined logits into language and AST regions for
-    dual-head loss computation."""
+    dual-head loss computation.
+    attn_heads / attn_window: only needed when any layer has has_attn=True."""
     op = gc.OpType
     E_id, final_id, layers = w['E'], w['final'], w['layers']
     router_id = w.get('router')
@@ -328,14 +401,55 @@ def _fb_run(t, w, ids, targets, d, dff, V, L, Vlang=None, Vast=None):
 
     x = emb
     for li, lw in enumerate(layers):
-        n1, G, Vv, D, H, r1, n2, gu, h, ff, r2 = cap[li]
+        has_attn = lw.get('has_attn', False)
+        if has_attn:
+            # Unpack all 18 elements for attention layers
+            n1, G, Vv, D, H_min, r1, ra_rms, qkv, q, k, v, attn_out, transpose, out_proj, r_attn, rms_attn_id, qkv_id_buf, out_proj_id = cap[li][:18]
+            ffn_input = r_attn
+            attn_H = attn_heads
+            attn_Dh = d // attn_heads if attn_heads else d
+        else:
+            # Unpack 6 elements + 5 FFN elements for non-attention layers
+            n1, G, Vv, D, H_min, r1 = cap[li][:6]
+            ffn_input = r1
+
+        # MinGRU block
         nn1 = t.record_op(op.RMSNorm, [_R(x, [BS, d]), _R(lw['n1'], [d])], [_R(n1, [BS, d])]); t.save_for_backward(nn1, [x, lw['n1']])
         nG = t.record_op(op.Linear, [_R(n1, [BS, d]), _R(lw['WG'], [d, d])], [_R(G, [BS, d])]); t.save_for_backward(nG, [n1, lw['WG']])
         nV = t.record_op(op.Linear, [_R(n1, [BS, d]), _R(lw['WV'], [d, d])], [_R(Vv, [BS, d])]); t.save_for_backward(nV, [n1, lw['WV']])
         nD = t.record_op(op.Linear, [_R(n1, [BS, d]), _R(lw['WD'], [d, d])], [_R(D, [BS, d])]); t.save_for_backward(nD, [n1, lw['WD']])
-        nM = t.record_op(op.MinGRU, [_R(G, [B, S, d]), _R(Vv, [B, S, d]), _R(D, [B, S, d])], [_R(H, [B, S, d])]); t.save_for_backward(nM, [G, Vv, D, H])
-        t.record_op(op.Add, [_R(x, [BS, d]), _R(H, [BS, d])], [_R(r1, [BS, d])])
-        nn2 = t.record_op(op.RMSNorm, [_R(r1, [BS, d]), _R(lw['n2'], [d])], [_R(n2, [BS, d])]); t.save_for_backward(nn2, [r1, lw['n2']])
+        nM = t.record_op(op.MinGRU, [_R(G, [B, S, d]), _R(Vv, [B, S, d]), _R(D, [B, S, d])], [_R(H_min, [B, S, d])]); t.save_for_backward(nM, [G, Vv, D, H_min])
+        t.record_op(op.Add, [_R(x, [BS, d]), _R(H_min, [BS, d])], [_R(r1, [BS, d])])
+
+        # Attention block (if enabled)
+        if has_attn:
+            # RMSNorm before attention
+            nra = t.record_op(op.RMSNorm, [_R(r1, [BS, d]), _R(lw['rms_attn'], [d])], [_R(ra_rms, [BS, d])]); t.save_for_backward(nra, [r1, lw['rms_attn']])
+            # QKV projection (fused: output is (BS, 3*d))
+            nqkv = t.record_op(op.Linear, [_R(ra_rms, [BS, d]), _R(lw['qkv'], [d, 3*d])], [_R(qkv, [BS, 3*d])]); t.save_for_backward(nqkv, [ra_rms, lw['qkv']])
+            # ChunkedAttention: record with qkv as single input so backward
+            # produces a single d_qkv gradient that flows to the Linear(QKV) node.
+            # q/k/v (from forward_qkv_split) are saved for the backward computation.
+            # Pass attention params (B, H, S, Dh, W, scale) as bytes for backward.
+            import struct as _struct
+            _attn_scale = 1.0 / float(attn_Dh) ** 0.5
+            _attn_params = _struct.pack('IIIIIf', B, attn_H, S, attn_Dh, attn_window, _attn_scale)
+            n_attn = t.record_op(op.ChunkedAttention,
+                                 [_R(qkv, [BS, 3*d])],
+                                 [_R(attn_out, [B, attn_H, S, attn_Dh])],
+                                 _attn_params)
+            t.save_for_backward(n_attn, [q, k, v])
+            # Transpose BHSD -> BSHD = (BS, d)
+            n_trans = t.record_op(op.Transpose, [_R(attn_out, [B, attn_H, S, attn_Dh])], [_R(transpose, [BS, d])])
+            t.save_for_backward(n_trans, [attn_out])
+            # Output projection
+            n_out = t.record_op(op.Linear, [_R(transpose, [BS, d]), _R(lw['out_proj'], [d, d])], [_R(out_proj, [BS, d])]); t.save_for_backward(n_out, [transpose, lw['out_proj']])
+            # Residual connection
+            t.record_op(op.Add, [_R(r1, [BS, d]), _R(out_proj, [BS, d])], [_R(r_attn, [BS, d])])
+
+        # FFN block (uses ffn_input which is r_attn for attention layers, r1 otherwise)
+        n2, gu, h, ff, r2 = cap[li][-5:]
+        nn2 = t.record_op(op.RMSNorm, [_R(ffn_input, [BS, d]), _R(lw['n2'], [d])], [_R(n2, [BS, d])]); t.save_for_backward(nn2, [ffn_input, lw['n2']])
         ngu = t.record_op(op.Linear, [_R(n2, [BS, d]), _R(lw['gate_up'], [2 * dff, d])], [_R(gu, [BS, 2 * dff])]); t.save_for_backward(ngu, [n2, lw['gate_up']])
         nsw = t.record_op(op.SwiGLU, [_R(gu, [BS, 2 * dff])], [_R(h, [BS, dff])]); t.save_for_backward(nsw, [gu])
         ndn = t.record_op(op.Linear, [_R(h, [BS, dff]), _R(lw['down'], [d, dff])], [_R(ff, [BS, d])]); t.save_for_backward(ndn, [h, lw['down']])
@@ -357,7 +471,8 @@ def _read_grads(t, w, emb, ids, BS, d, dff, V, L):
     ids = np.asarray(ids, dtype=np.int64)
 
     def gr(b, sh): return t.read_buffer(t.get_grad_buffer(b), sh) / BS
-    out = dict(n1=[], n2=[], proj=[], gate_up=[], down=[])
+    out = dict(n1=[], n2=[], proj=[], gate_up=[], down=[], has_attn=[],
+               rms_attn=[], qkv=[], out_proj=[])
     for lw in layers:
         out['n1'].append(gr(lw['n1'], [d]))
         out['n2'].append(gr(lw['n2'], [d]))
@@ -365,6 +480,14 @@ def _read_grads(t, w, emb, ids, BS, d, dff, V, L):
         gsw = gr(lw['gate_up'], [2 * dff, d])
         out['gate_up'].append(np.concatenate([gsw[dff:2 * dff], gsw[0:dff]], axis=0))
         out['down'].append(gr(lw['down'], [d, dff]))
+        
+        has_attn = lw.get('has_attn', False)
+        out['has_attn'].append(has_attn)
+        if has_attn:
+            out['rms_attn'].append(gr(lw['rms_attn'], [d]))
+            out['qkv'].append(gr(lw['qkv'], [d, 3*d]))
+            out['out_proj'].append(gr(lw['out_proj'], [d, d]))
+    
     out['final'] = gr(final_id, [d])
     emb_g = gr(emb, [BS, d])
     dE = np.zeros((V, d), np.float32); np.add.at(dE, ids.reshape(-1), emb_g)
@@ -382,14 +505,22 @@ def _snapshot(model):
     """Init params from a CubbyLM in model.py layout. COPIES (model.py AdamW
     mutates p.data in place; a view would alias the trained weights)."""
     cp = lambda a: np.array(a, dtype=np.float32, copy=True)
-    return dict(
+    out = dict(
         embed=cp(model.embed.data), final=cp(model.final.data),
         n1=[cp(b.n1.data) for b in model.blocks],
         n2=[cp(b.n2.data) for b in model.blocks],
         proj=[cp(b.mix.proj.weight.data) for b in model.blocks],
         gate_up=[cp(b.ffn.gate_up.weight.data) for b in model.blocks],
         down=[cp(b.ffn.down.weight.data) for b in model.blocks],
+        has_attn=[getattr(b, 'has_attn', False) for b in model.blocks],
+        rms_attn=[], qkv_w=[], out_proj_w=[],
     )
+    for b in model.blocks:
+        if getattr(b, 'has_attn', False):
+            out['rms_attn'].append(cp(b.rms_attn.data))
+            out['qkv'].append(cp(b.attn.qkv.weight.data))
+            out['out_proj'].append(cp(b.attn.out_proj.weight.data))
+    return out
 
 
 def _ce(logits, tgt):
@@ -511,6 +642,12 @@ def _adamw_np(P, g, m, v, step, lr, b1, b2, eps, wd):
     for k in ('n1', 'n2', 'proj', 'gate_up', 'down'):
         for i in range(len(P[k])):
             upd(P[k][i], g[k][i], m[k][i], v[k][i])
+    # Attention weights
+    for i in range(len(P.get('has_attn', []))):
+        if P['has_attn'][i]:
+            upd(P['rms_attn'][i], g['rms_attn'][i], m['rms_attn'][i], v['rms_attn'][i])
+            upd(P['qkv'][i], g['qkv'][i], m['qkv'][i], v['qkv'][i])
+            upd(P['out_proj'][i], g['out_proj'][i], m['out_proj'][i], v['out_proj'][i])
 
 
 def loss_curve_match(dev, steps=30):
