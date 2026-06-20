@@ -168,4 +168,46 @@ Implements chunked sliding-window causal attention with O(S·W) memory complexit
 - Residual scaling applied to attention output projection when enabled
 - All parameters (QKV, output projection, rms_attn) receive gradients
 
+## 0.1.0 design note: MMoE/PLE cortical-router perception head (June 2026)
+
+A concrete design for the **0.1.0 cortical router** (the "high road" of the
+afferent gate): a Multi-gate Mixture-of-Experts / Progressive Layered Extraction
+head that reads the trunk's hidden state and emits a **structured multi-task
+perception vector** along the router's classification axes. This is the gate's
+feature extractor, not a trunk output head.
+
+**Architecture.** Shared trunk features → a pool of N unlabeled expert MLPs
+(self-specializing) → one tiny **gating network per task** (softmax over experts)
+→ a per-task **tower** projecting the gate-blended expert mix to that task's dim.
+Initial task partitions: semantic, emotion, intent, POS, opcode-recognition. The
+per-task gates are what mitigate **negative transfer** (binary-opcode gradients
+vs emotional-nuance gradients fighting in a single dense head).
+
+**Decisions (load-bearing — these are why it's here and not earlier):**
+1. **Post-training adapter over a FROZEN trunk — never co-trained during
+   pretraining.** Same v4 lesson as the VSA head: a novel multi-task head
+   co-trained with the substrate risks tanking generation while PPL looks fine,
+   and the pooled-representation objective fights next-token CE. It attaches like
+   MTP (0.0.7) and the MindForge adapter bank (0.0.9): frozen trunk, no retrain.
+2. **Split per-token from per-sequence tasks.** Emotion / intent / domain are
+   per-sequence (mean-pool the hidden states). **POS and opcode are per-token** —
+   pooling destroys their signal; they run as a per-token head over the unpooled
+   states. One pooled head + one per-token head, not a single pooled head.
+3. **Opcode tower is recognition only, not reasoning.** It tags/recognizes
+   opcodes for routing; opcode *reasoning* stays in the CubeLang VM over grounded
+   reps (the off-token-axis thesis). Re-importing opcode reasoning into LM
+   activations was part of the v4 failure.
+4. **Distinct from 0.0.3 trunk MoE.** 0.0.3 is MoE *in the trunk* (token-level
+   capacity/sparsity, MoE-MinGRU). This is MoE *over frozen features* for
+   multi-task perception. Different mechanism, different purpose.
+5. **Sparse Top-2 gating** is the efficiency path once dense gating is validated;
+   the explicit gate probabilities are **printable per state transition** →
+   satisfies the observability invariant (the VM/viewer can show how much each
+   task leaned on each expert).
+
+**Gate:** each task lifts its own metric (accuracy / F1) over a dense-head
+baseline at matched budget, **with no regression in trunk generation** (frozen
+trunk guarantees the latter by construction). Builds at 0.1.0 alongside the SNN
+threat path and the WorldManager specialists it routes to.
+
 **Status:** ✅ Complete. Forward+backward validated. Ready for resident path integration.
