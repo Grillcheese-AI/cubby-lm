@@ -52,7 +52,8 @@ def cmd_train(args):
                              B=args.batch, S=args.seqlen, lr=args.lr,
                              warmup=args.warmup, max_grad_norm=args.clip,
                              tokenizer=args.tokenizer, ckpt_path=args.ckpt,
-                             prompt=args.prompt, identity_probe=args.identity_probe)
+                             prompt=args.prompt, identity_probe=args.identity_probe,
+                             max_tokens=args.max_tokens)
 
 
 def cmd_eval(args):
@@ -104,6 +105,9 @@ def build_parser() -> argparse.ArgumentParser:
     tr.add_argument("--ckpt", default=None,
                     help="checkpoint path (default ckpt_<version>.grl). --data accepts a "
                          "single file (.json/.jsonl/.txt) or a weighted mix 'a:0.9,b:0.1'")
+    tr.add_argument("--max-tokens", dest="max_tokens", type=int, default=4000000,
+                    help="token-stream size. Smaller => more epochs for a given --steps "
+                         "(B*S tokens/step); shrink it for a fast coherence/identity signal")
     tr.add_argument("--prompt", default="The ",
                     help="periodic-sample prompt (default neutral; use a domain-matched one)")
     tr.add_argument("--identity-probe", dest="identity_probe",

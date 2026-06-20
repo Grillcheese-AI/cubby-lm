@@ -15,9 +15,10 @@
 #>
 param(
     [switch]$Resume,
-    [int]$Steps = 1000,
+    [int]$Steps = 4000,
     [int]$Batch = 4,
-    [int]$SeqLen = 128
+    [int]$SeqLen = 128,
+    [int]$MaxTokens = 600000   # smaller stream => more epochs per step; ~5 epochs at 4000 steps
 )
 
 $ErrorActionPreference = "Stop"
@@ -42,9 +43,10 @@ $trainArgs = @(
     "--tokenizer", "mbpe32k",
     "--data",      $data,
     "--ckpt",      $ckpt,
-    "--steps",     "$Steps",
-    "--batch",     "$Batch",
-    "--seqlen",    "$SeqLen",
+    "--steps",      "$Steps",
+    "--batch",      "$Batch",
+    "--seqlen",     "$SeqLen",
+    "--max-tokens", "$MaxTokens",
     "--lr",        "3e-4",
     "--warmup",    "50",
     "--clip",      "1.0"
