@@ -333,10 +333,15 @@ class ResidentTrunk:
 
     # --- autoregressive generation (resident forward) ---------------------------
     def generate(self, prompt_ids, max_new_tokens=80, temperature=0.8, seed=0,
-                 rep_penalty=1.0):
+                 rep_penalty=1.0, stop_tokens=(), stop_fn=None):
+        """Autoregressive generation. `stop_tokens` ends on any of those ids (e.g.
+        </s>=3); `stop_fn(generated_ids)->bool` ends early (e.g. program braces
+        balanced). Bounding generation keeps the sequence short -- each step is a
+        full O(S) forward + readback, so unbounded runs are the main GPU stress."""
         rng = np.random.default_rng(seed)
         ids = list(np.asarray(prompt_ids, dtype=np.int64).reshape(-1))
         n_prompt = len(ids)
+        stop_set = set(int(s) for s in stop_tokens)
         for _ in range(max_new_tokens):
             lg = self.logits(np.asarray(ids, dtype=np.int64)[None, :])[0, -1]
             if not np.isfinite(lg).all():
@@ -352,6 +357,10 @@ class ResidentTrunk:
                 z = lg / temperature; z -= z.max(); p = np.exp(z); p /= p.sum()
                 nxt = int(rng.choice(len(p), p=p))
             ids.append(nxt)
+            if nxt in stop_set:
+                break
+            if stop_fn is not None and stop_fn(ids[n_prompt:]):
+                break
         return ids
 
 
@@ -1099,8 +1108,17 @@ def train_cubby_sft(version="mbpe_emit", steps=2000, data="", B=8, S=256, lr=3e-
         return ib, tb, mb
 
     def sample():
+        st = {"depth": 0, "opened": False}
+        def _stop(gen_ids):                                 # stop at program-end (bounded gen)
+            for ch in tok.decode(gen_ids[-1:], skip_special=False):
+                if ch == "{":
+                    st["depth"] += 1; st["opened"] = True
+                elif ch == "}":
+                    st["depth"] -= 1
+            return st["opened"] and st["depth"] <= 0
         out = rt.generate(tok.encode("[INSTRUCTION]\n%s\n[/INSTRUCTION]\n" % sample_prompt),
-                          max_new_tokens=gen_tokens, temperature=0.0)
+                          max_new_tokens=gen_tokens, temperature=0.0,
+                          stop_tokens=(3,), stop_fn=_stop)
         # skip_special=False: render opcode/role AST tokens as literal source
         return tok.decode(out, skip_special=False).encode("ascii", "backslashreplace").decode("ascii")
 
@@ -1220,7 +1238,8 @@ def eval_full_softmax_ppl(version="mbpe_v33", data="tinystory_50k.json",
 
 def generate_from_checkpoint(version="mbpe_v33", prompt="The ", tokenizer="mbpe32k",
                              ckpt_path=None, dev=None, max_new_tokens=80,
-                             temperature=0.8, seed=0, skip_special=True, rep_penalty=1.0):
+                             temperature=0.8, seed=0, skip_special=True, rep_penalty=1.0,
+                             program_stop=False):
     """Load a checkpoint and free-run from `prompt`. Spot-check coherence and the
     Grilly identity -- for the latter, prompt in the chat format the identity
     corpus uses, e.g.:
@@ -1247,8 +1266,19 @@ def generate_from_checkpoint(version="mbpe_v33", prompt="The ", tokenizer="mbpe3
         raise SystemExit("checkpoint shape mismatch for version %s" % version)
     _ckpt.apply_model_state(model, ms)
     rt = ResidentTrunk(model, dev or make_device())
+    stop_fn = None
+    if program_stop:
+        st = {"depth": 0, "opened": False}
+        def stop_fn(gen_ids):                               # end when program braces balance
+            for ch in tok.decode(gen_ids[-1:], skip_special=False):
+                if ch == "{":
+                    st["depth"] += 1; st["opened"] = True
+                elif ch == "}":
+                    st["depth"] -= 1
+            return st["opened"] and st["depth"] <= 0
     out = rt.generate(tok.encode(prompt), max_new_tokens=max_new_tokens,
-                      temperature=temperature, seed=seed, rep_penalty=rep_penalty)
+                      temperature=temperature, seed=seed, rep_penalty=rep_penalty,
+                      stop_tokens=(3,), stop_fn=stop_fn)     # 3 = </s>
     text = tok.decode(out, skip_special=skip_special).encode("ascii", "backslashreplace").decode("ascii")
     print("[gen] %s @ step %d  T=%.2f  prompt=%r\n%s"
           % (version, int(meta.get("step", 0)), temperature, prompt, text), flush=True)
