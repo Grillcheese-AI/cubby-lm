@@ -152,11 +152,61 @@ class RemapTokenizer:
         return self.base.decode([inv[i] for i in (int(x) for x in ids) if i in inv])
 
 
+class DualHeadRemap:
+    """Wraps a tokenizer whose AST/CubeLang token ids are scattered (interleaved at
+    the front of the vocab) so they become a CONTIGUOUS TAIL [V-n_ast, V).
+
+    The dual-head trunk assumes `id < Vlang` == language and `id >= Vlang` == AST
+    (separate embed_lang/embed_ast tables, a contiguous logit split, and the
+    `tgt >= Vlang` loss classification). MultilingualBPE breaks that: its
+    `ast_token_ids` sit at low ids (~20-66) while `lang_vocab_size` is just a COUNT,
+    so `tgt >= Vlang` selects the 47 *rarest BPE fragments* instead of the AST
+    tokens -- the AST head trains on garbage and opcodes route to the language head.
+
+    Fix without touching the (parity-validated) model math: a bijective INVOLUTION
+    that swaps the n_ast AST ids with the n_ast highest ids. Applied in both
+    encode and decode (self-inverse), it is transparent everywhere else and makes
+    the contiguity assumption true. Requires a retrain (token ids change).
+    """
+    kind = "multilingual_bpe"
+
+    def __init__(self, base):
+        self.base = base
+        V, A = base.vocab_size, sorted(base.ast_token_ids)
+        n = len(A)
+        tail = list(range(V - n, V))
+        self.swap = {}
+        for a, t in zip(A, tail):
+            if a != t:
+                self.swap[a] = t
+                self.swap[t] = a                       # involution
+        self.vocab_size = V
+        self.n_ast_tokens = n
+        self.n_special_tokens = getattr(base, "n_special_tokens", n)
+        self.lang_vocab_size = V - n
+        self.ast_token_ids = frozenset(tail)
+
+    def _map(self, ids):
+        s = self.swap
+        return [s.get(int(i), int(i)) for i in ids]
+
+    def encode(self, text):
+        return self._map(self.base.encode(text))
+
+    def decode(self, ids):
+        return self.base.decode(self._map(ids))
+
+    def is_ast_token(self, token_id):
+        return int(token_id) in self.ast_token_ids
+
+
 def make_tokenizer(kind: str = "byte", path: str | None = None):
     if kind == "byte":
         return ByteTokenizer()
     if kind in ("bpe", "bbpe65k"):
         return BPETokenizer(path or BBPE65K_PATH)
     if kind in ("multilingual_bpe", "mbpe", "mbpe32k"):
-        return MultilingualBPE(path)
+        # Remap so AST ids are a contiguous tail -> the dual-head's id-range
+        # split (id >= Vlang == AST) is then correct.
+        return DualHeadRemap(MultilingualBPE(path))
     raise ValueError(f"unknown tokenizer kind {kind!r}")

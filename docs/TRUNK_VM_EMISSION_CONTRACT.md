@@ -83,6 +83,25 @@ codebook so opcodes round-trip; it is NOT a "(k,l) block-code" scheme.
    tokens to the executable opcode + role + structural set, (d) grammar-masked
    decode wired to `validate`.
 
+## ⚠️ DEFERRED — come back to this: two emission/verification modes
+Empirically tested `cubelang/examples/conversation_agent/` against the real VM:
+both `check` + `compile` + `run` succeed. This proves the emission target is wider
+than flat arithmetic tuples. There are **two modes**, both compile-and-run:
+1. **Scalar-verifiable** (arithmetic/decision → a number): ground truth =
+   `result == gold`. Airtight today (the v4 corpus, GSM8K, `conversation_min.cube`
+   → `solve() -> 10`).
+2. **Structural ISolver modules** (full templates with `struct`/`event`/`match`/
+   `storage` → a **struct** output, e.g. `conversation_agent.cube` →
+   `solve() -> null`): not externally gold-checkable (no scalar), but **self-verify**
+   via the program's own `verify()` (e.g. `text != "" && confidence > 0 &&
+   trace.length > 0`), which runs deterministically.
+Caveat: mode-2 leans on `match`, which the VM currently compiles with ALL arms
+unconditionally (P2-2) — so it executes but the branching isn't yet faithful.
+**TODO when we return here:** fold the two-mode distinction into the emission ladder
+(scalar-verifiable now → structural self-verify next → faithful `match` once P2-2
+lands), classify the v4 sets by scalar-vs-struct return, and target the
+`conversation_*` style as the mode-2 emission exemplar.
+
 ## Build-order placement
 This is rung **0.0.8** (CubeLang head + VM bridge), but the *contract* can be fixed
 now and the dual-head trained toward it incrementally. The dependency: the trunk
