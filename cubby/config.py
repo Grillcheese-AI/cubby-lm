@@ -182,7 +182,16 @@ VERSIONS: dict[str, dict] = {
         _R2,  # = _R1 + enable_attention=True (chunked SWA every 3rd)
         vocab_size=32768, tokenizer_kind="multilingual_bpe",
         enable_dual_head=True, enable_sampled_softmax=True, n_samples=1024,
-        d_model=1024, n_layers=8, d_ffn=4096, seq_len=512,
+        d_model=1024, n_layers=12, d_ffn=4096, seq_len=512,
+    ),
+    # Head-1 emission: SINGLE-HEAD mbpe (the dual-head opcode path is dead/insecure;
+    # the trunk emits .cube SOURCE as text, the compiler gates it -- see
+    # docs/TRUNK_VM_EMISSION_CONTRACT.md). Full softmax (honest loss; V=32k is cheap).
+    # Attention on (programs have structure). Trained on the verified v4 source corpus.
+    "mbpe_emit": dict(
+        _R2, vocab_size=32768, tokenizer_kind="multilingual_bpe",
+        enable_dual_head=False, enable_sampled_softmax=False,
+        d_model=1024, n_layers=8, d_ffn=2048, seq_len=256,
     ),
 }
 
