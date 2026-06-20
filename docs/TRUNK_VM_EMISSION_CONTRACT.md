@@ -97,6 +97,47 @@ target).
 
 ---
 
+## 3a. Head-1 training ladder: SFT → RLVR (the 0.0.8 plan of record)
+
+The trunk learns to emit *valid* programs, then *correct* ones. Two rungs, never
+skipped — RL from scratch on sparse verify rewards barely moves; RL on a model that
+already emits valid programs takes off (so SFT is the prerequisite, not optional).
+
+### Rung 1 — SFT (completion-only, prompt-masked)  ✅ BUILT
+Train `p(program | instruction)` on the verified v4 `(instruction, program)` pairs
+with loss masked to the program tokens only (the model never wastes capacity
+generating the NL instruction). Teaches program **format/validity**.
+- `train_cubby_sft` / `train_step_sft`: masked dlogits seeded at the head node;
+  gradient verified to finite-diff (2.9e-10), zero grad on prompt positions.
+- Observed: clean valid program *structure* fast, but **not yet task-conditioned**
+  (emits a valid template, not always the *right* one for the instruction).
+
+### Rung 2 — RLVR (RL from Verifiable Rewards; the VM is the verifier)
+Reward the program that **executes to the gold answer** — ungameable, unlike a
+"right-template" proxy (you can't get 8 out of a role-binding program). This is the
+o1 / DeepSeek-R1 recipe; Cubby fits it *better* because the VM is a free, exact,
+deterministic verifier (no learned reward model).
+
+- **Reward = the shaped ladder** (partial credit, so there's signal before full
+  correctness — the curriculum that pulls valid → right → correct):
+  `r = 0.1·parses + 0.2·compiles + 0.3·executes + 1.0·(result == gold)`.
+  `cubby/tools/emit_eval.py::run_cube()` already returns parses/compiles/executes/
+  result — **it IS the reward function.**
+- **GRPO-style update** (R1's method): per prompt, sample K programs, score each via
+  the VM, advantage `A_i = r_i − mean(r)`; the policy gradient raises the log-prob
+  of above-average programs.
+- **Reuses the SFT machinery.** REINFORCE/GRPO is a reward-weighted seeded-dlogits:
+  `dlogits[token pos] = A · (softmax − onehot(sampled_token))` seeded at the head
+  (`_fb_run` `dlogits_fn`). `train_step_sft` is ~90% of `train_step_grpo`; the new
+  part is sample-K → VM-score → advantage-weight.
+- **eggroll** (grilly gradient-free ES) is the alternative for genuinely
+  non-differentiable bits — the fit flagged in the throughput/optim notes.
+
+### Gate
+Rung 1: parse/compile rate up from ~0 (masking). Rung 2: **verify-to-gold** rate up
+(task-conditioning + value correctness). Both measured by `emit_eval` on held-out
+prompts. RLVR is what fixes the wrong-template / wrong-value problem SFT leaves.
+
 ## 4. Head 2 — safety classifier: training design
 
 **Architecture.** Pooled sequence classification over the trunk hidden state
