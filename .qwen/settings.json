@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(C:\\Users\\grill\\Documents\\GitHub\\grilly\\tokenizer_impl/**)",
+      "Read(C:\\Users\\grill\\Documents\\GitHub\\grilly/**)",
+      "Read(C:\\Users\\grill\\Documents\\GitHub\\grilly\\tests/**)",
+      "Read(C:\\Users\\grill\\Documents\\GitHub\\grilly\\tests\\sentencepiece/**)",
+      "Read(C:\\Users\\grill\\Documents\\GitHub\\grilly\\experimental\\resident_train/**)",
+      "Read(C:\\Users\\grill\\Documents\\GitHub\\grilly\\backend/**)",
+      "Read(C:\\Users\\grill\\Documents\\GitHub\\grilly\\functional/**)",
+      "Read(C:\\Users\\grill\\Documents\\GitHub\\grilly\\shaders/**)",
+      "Read(C:\\Users\\grill\\Documents\\GitHub\\grilly\\tests\\tokenizers/**)",
+      "Read(C:\\Users\\grill\\Documents\\GitHub\\grilly\\cpp/**)",
+      "Read(C:\\Users\\grill\\Documents\\GitHub\\grilly\\pyproject.toml/**)",
+      "Read(C:\\Users\\grill\\Documents\\GitHub\\grilly\\__init__.py/**)",
+      "Read(C:\\Users\\grill\\Documents\\GitHub\\grilly\\cpp\\python/**)",
+      "Read(C:\\Users\\grill\\Documents\\GitHub\\grilly\\cpp\\src/**)",
+      "Read(C:\\Users\\grill\\Documents\\GitHub\\grilly\\cpp\\include\\grilly\\autograd/**)",
+      "Read(C:\\Users\\grill\\Documents\\GitHub\\grilly\\experimental/**)",
+      "Read(C:\\Users\\grill\\Documents\\GitHub\\grilly\\cpp\\include/**)",
+      "Read(C:\\Users\\grill\\Documents\\GitHub\\grilly\\nn/**)",
+      "Read(C:\\Users\\grill\\Documents\\GitHub\\grilly\\cpp\\include\\grilly\\ops/**)",
+      "Read(C:\\Users\\grill\\Documents\\GitHub\\grilly\\cpp\\src\\autograd.cpp/**)",
+      "Read(C:\\Users\\grill\\Documents\\GitHub\\grilly\\cpp\\include\\grilly/**)",
+      "Read(C:\\Users\\grill\\Documents\\GitHub\\grilly\\cpp\\python\\bindings_autograd.cpp/**)",
+      "Bash(dir *)"
+    ]
+  },
+  "$version": 4
+}

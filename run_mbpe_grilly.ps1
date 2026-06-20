@@ -16,8 +16,8 @@
 param(
     [switch]$Resume,
     [int]$Steps = 10000,
-    [int]$Batch = 4,
-    [int]$SeqLen = 128,        # N=512 sweet spot; it/s is ~flat vs S, so 128 >> 64 in tokens/sec
+    [int]$Batch = 8,
+    [int]$SeqLen = 64,        # N=512 sweet spot; it/s is ~flat vs S, so 128 >> 64 in tokens/sec
     [int]$MaxTokens = 600000,  # smaller stream => more epochs per step
     [string]$Lr = "6e-4"       # ceiling per the grad-norm diagnosis; safe with clip+warmup
 )
