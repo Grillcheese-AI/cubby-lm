@@ -283,6 +283,54 @@ class ResidentTrunk:
         t.forward_submit()
         return loss, gnorm, False
 
+    def train_step_sft(self, ids, targets, mask, step, lr=3e-4, betas=(0.9, 0.95),
+                       eps=1e-8, wd=0.01, max_grad_norm=1.0):
+        """One resident step with PROMPT-MASKED (completion-only) loss: CE is
+        computed and backpropped ONLY where mask==1 (the program tokens), so the
+        model learns p(program | instruction) and never wastes capacity generating
+        the NL instruction. Custom dlogits are seeded at the head node (see
+        _fb_run dlogits_fn). Returns (masked-mean CE, pre-clip gnorm, skipped)."""
+        d, V = self.d, self.V
+        ids = np.asarray(ids, dtype=np.int64); B, S = ids.shape; BS = B * S
+        tgt = np.asarray(targets, np.int64).reshape(-1)
+        m = np.asarray(mask, np.float32).reshape(-1)
+        n_comp = float(m.sum())
+        if n_comp < 1.0:
+            return 0.0, 0.0, True
+        box = {}
+        def dlogits_fn(logits_np):
+            z = logits_np - logits_np.max(axis=1, keepdims=True)
+            sm = np.exp(z); sm /= sm.sum(axis=1, keepdims=True)
+            nll = -np.log(sm[np.arange(BS), tgt] + 1e-12)
+            box['loss'] = float((nll * m).sum() / n_comp)        # masked-mean CE
+            sm[np.arange(BS), tgt] -= 1.0                        # softmax - onehot
+            sm *= m[:, None]                                     # zero prompt/pad (raw sum)
+            return sm
+        t = self.t; t.begin()
+        w = self._w()
+        attn_H = self.attn_n_heads if self.has_attn else 0
+        emb, _, _, _, _, _, _, _ = _fb_run(
+            t, w, ids, targets, d, self.dff, V, self.L,
+            attn_heads=attn_H, attn_window=self.attn_window, dlogits_fn=dlogits_fn)
+        loss = box.get('loss', 0.0)
+        ids_u32 = t.register_input_u32(ids.reshape(-1).astype(np.uint32))
+        t.embedding_scatter_add(t.get_grad_buffer(emb), ids_u32,
+                                t.get_grad_buffer(self.E['w']), BS, d)
+        sq = t.sum_squares([t.get_grad_buffer(p['w']) for p in self.opt],
+                           [p['n'] for p in self.opt])
+        gnorm = float(np.sqrt(float(sq))) / n_comp               # raw grads are sum/comp
+        if not np.isfinite(gnorm):
+            return loss, gnorm, True
+        clip = min(1.0, max_grad_norm / (gnorm + 1e-6)) if max_grad_norm else 1.0
+        gscale = clip / n_comp                                   # mean over COMPLETION tokens
+        b1, b2 = betas; b1t, b2t = b1 ** step, b2 ** step
+        t.forward_begin()
+        for p in self.opt:
+            t.adamw_update(p['w'], t.get_grad_buffer(p['w']), p['m'], p['v'], p['n'],
+                           lr, b1, b2, eps, wd, b1t, b2t, False, gscale)
+        t.forward_submit()
+        return loss, gnorm, False
+
     # --- autoregressive generation (resident forward) ---------------------------
     def generate(self, prompt_ids, max_new_tokens=80, temperature=0.8, seed=0):
         rng = np.random.default_rng(seed)
@@ -381,13 +429,18 @@ def _resident_forward(t, w, ids, d, dff, V, L,
 
 
 def _fb_run(t, w, ids, targets, d, dff, V, L, Vlang=None, Vast=None,
-            attn_heads=0, attn_window=0):
+            attn_heads=0, attn_window=0, dlogits_fn=None):
     """Resident forward + backward (records the matching graph, one backward()).
     Returns (emb_id, logits_numpy, BS, router_logits_np, nf_id, logits_id, Vlang, Vast).
     Grad buffers are then readable via t.get_grad_buffer(weight_id) / get_grad_buffer(emb_id).
     Vlang/Vast partition the combined logits into language and AST regions for
     dual-head loss computation.
-    attn_heads / attn_window: only needed when any layer has has_attn=True."""
+    attn_heads / attn_window: only needed when any layer has has_attn=True.
+
+    dlogits_fn: optional `(logits_np) -> dlogits (BS, V)` for a CUSTOM loss (e.g.
+    completion-only / prompt-masked SFT). When given, the head node's output
+    gradient is seeded DIRECTLY with dlogits and the GPU CrossEntropy node is
+    skipped -- so the loss can be any host-computed function of the logits."""
     op = gc.OpType
     E_id, final_id, layers = w['E'], w['final'], w['layers']
     router_id = w.get('router')
@@ -461,8 +514,14 @@ def _fb_run(t, w, ids, targets, d, dff, V, L, Vlang=None, Vast=None,
     nHead = t.record_op(op.Linear, [_R(nf, [BS, d]), _R(E_id, [V, d])], [_R(logits, [BS, V])]); t.save_for_backward(nHead, [nf, E_id])
     if router_logits_id is not None:
         nRouter = t.record_op(op.Linear, [_R(nf, [BS, d]), _R(router_id, [2, d])], [_R(router_logits_id, [BS, 2])]); t.save_for_backward(nRouter, [nf, router_id])
-    nCE = t.record_op(op.CrossEntropy, [_R(logits, [BS, V])], [_R(0, [1], False)]); t.save_for_backward(nCE, [logits, tgt_id])
-    t.backward(nCE, 0)
+    if dlogits_fn is not None:
+        # Custom loss (e.g. prompt-masked SFT): seed the head node's output grad
+        # directly with host-computed dlogits, skipping the GPU CrossEntropy node.
+        dl = np.ascontiguousarray(dlogits_fn(logits_np), dtype=np.float32)
+        t.backward(nHead, t.register_input(dl, False))
+    else:
+        nCE = t.record_op(op.CrossEntropy, [_R(logits, [BS, V])], [_R(0, [1], False)]); t.save_for_backward(nCE, [logits, tgt_id])
+        t.backward(nCE, 0)
     return emb, logits_np, BS, router_logits_np, nf, logits, Vlang, Vast
 
 
@@ -839,6 +898,37 @@ def _load_token_stream(data, tok, max_tokens, seed=0):
     return sb
 
 
+def _load_sft_examples(data, tok, max_examples=200000):
+    """Load (prompt_ids, program_ids) pairs from v4-style jsonl(s) for prompt-masked
+    SFT. prompt = `[INSTRUCTION]\\n<nl>\\n[/INSTRUCTION]\\n`; completion = the
+    `cubelang_program` SOURCE. `data` is a path or comma-mix (resolved per-source)."""
+    import os, json
+    exs = []
+    for path, _w in _parse_sources(data):
+        if not os.path.isabs(path) and not os.path.exists(path):
+            path = os.path.join(_CUBBY_ROOT, path)
+        with open(path, "r", encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    e = json.loads(ln)
+                except Exception:
+                    continue
+                prog = e.get("cubelang_program")
+                if not prog:
+                    continue
+                nl = e.get("prompt") or e.get("question") or e.get("text") or ""
+                p_ids = tok.encode("[INSTRUCTION]\n%s\n[/INSTRUCTION]\n" % nl)
+                c_ids = tok.encode(prog)
+                if c_ids:
+                    exs.append((p_ids, c_ids))
+                if len(exs) >= max_examples:
+                    return exs
+    return exs
+
+
 def train_cubby_resident(version="0.0.0", steps=600, data="tinystory_50k.json",
                          B=8, S=64, lr=3e-4, max_tokens=4000000, sample_every=200,
                          prompt="Once upon a time", gen_tokens=60, dev=None,
@@ -958,6 +1048,100 @@ def train_cubby_resident(version="0.0.0", steps=600, data="tinystory_50k.json",
         _save("final")
     if nskip:
         print("[warn] %d step(s) skipped (non-finite grad)" % nskip, flush=True)
+    print("[done] %.1fs  final sample: %r" % (_time.perf_counter() - t0, sample()), flush=True)
+    return rt, tok
+
+
+def train_cubby_sft(version="mbpe_emit", steps=2000, data="", B=8, S=256, lr=3e-4,
+                    max_examples=200000, sample_every=200,
+                    sample_prompt="What is 5 plus 3?", gen_tokens=160, dev=None,
+                    warmup=50, max_grad_norm=1.0, ckpt_path=None, ckpt_every=200,
+                    resume=True, max_consec_skips=10, tokenizer="mbpe32k"):
+    """Prompt-masked SFT: train p(program | instruction) on (instruction, program)
+    pairs with COMPLETION-ONLY loss (loss masked to the program tokens). The trunk
+    emits `.cube` SOURCE; the compiler is the gate. See
+    docs/TRUNK_VM_EMISSION_CONTRACT.md."""
+    import os, time as _time
+    force_numpy_reference()
+    from cubby.config import make_config
+    from cubby.trunk.model import CubbyLM, param_count
+    from cubby.tokenizer import make_tokenizer
+    from cubby.trunk import checkpoint as _ckpt
+    np.random.seed(0)
+    cfg = make_config(version)
+    tok = make_tokenizer(tokenizer)
+    if hasattr(tok, 'lang_vocab_size') and hasattr(tok, 'n_ast_tokens'):
+        cfg.vocab_size = tok.lang_vocab_size
+        cfg.n_special_tokens = tok.n_ast_tokens
+    exs = _load_sft_examples(data, tok, max_examples)
+    if not exs:
+        raise SystemExit("no SFT examples loaded from %r" % data)
+    rng = np.random.default_rng(0)
+
+    def batch():
+        idx = rng.integers(0, len(exs), size=B)
+        ib = np.zeros((B, S), np.int64); tb = np.zeros((B, S), np.int64)
+        mb = np.zeros((B, S), np.float32)
+        for bi, ei in enumerate(idx):
+            p, c = exs[int(ei)]
+            full = (p + c)[: S + 1]
+            Lp = len(p)
+            for i in range(len(full) - 1):
+                ib[bi, i] = full[i]; tb[bi, i] = full[i + 1]
+                mb[bi, i] = 1.0 if (i + 1) >= Lp else 0.0   # loss only on program tokens
+        return ib, tb, mb
+
+    def sample():
+        out = rt.generate(tok.encode("[INSTRUCTION]\n%s\n[/INSTRUCTION]\n" % sample_prompt),
+                          max_new_tokens=gen_tokens, temperature=0.0)
+        return tok.decode(out).encode("ascii", "backslashreplace").decode("ascii")
+
+    if ckpt_path is None:
+        ckpt_path = os.path.join(_CUBBY_ROOT, "ckpt_%s.grl" % version)
+    model = CubbyLM(cfg)
+    start_step = 0
+    if resume and os.path.exists(ckpt_path):
+        ms, meta = _ckpt.load_checkpoint(ckpt_path)
+        if _ckpt.checkpoint_matches(meta, cfg):
+            _ckpt.apply_model_state(model, ms); start_step = int(meta.get("step", 0))
+            print("[resume] %s @ step %d" % (ckpt_path, start_step), flush=True)
+    rt = ResidentTrunk(model, dev or make_device())
+    print("[sft] %s V=%d d=%d L=%d examples=%d B=%d S=%d params=%d" % (
+        version, cfg.total_vocab, cfg.d_model, cfg.n_layers, len(exs), B, S, param_count(model)), flush=True)
+    print("[hp] lr=%.1e warmup=%d clip=%s (prompt-masked, completion-only)" % (lr, warmup, max_grad_norm), flush=True)
+    guard = _ckpt.SkipGuard(max_consecutive=max_consec_skips)
+    step = start_step
+
+    def _save(tag):
+        try:
+            _ckpt.save_checkpoint(ckpt_path, rt, step=step, rng=rng, version=version,
+                                  lr=lr, warmup=warmup, max_grad_norm=max_grad_norm)
+            print("[ckpt] %s @ step %d -> %s" % (tag, step, ckpt_path), flush=True)
+        except Exception as _e:
+            print("[ckpt] save FAILED (%s): %r" % (tag, _e), flush=True)
+
+    t0 = _time.perf_counter(); nskip = 0
+    try:
+        for step in range(start_step + 1, steps + 1):
+            ib, tb, mb = batch()
+            lr_t = lr * min(1.0, step / warmup) if warmup else lr
+            loss, gnorm, skipped = rt.train_step_sft(ib, tb, mb, step, lr=lr_t, max_grad_norm=max_grad_norm)
+            nskip += int(skipped)
+            print("[%4d/%d] ce=%.3f ppl=%.1f gnorm=%.2e lr=%.1e (%.2f it/s)%s" % (
+                step, steps, loss, np.exp(min(loss, 20)), gnorm, lr_t,
+                step / (_time.perf_counter() - t0), "  [skipped]" if skipped else ""), flush=True)
+            if guard.update(skipped):
+                print("[abort] divergence", flush=True); _save("diverge"); break
+            if sample_every and step % sample_every == 0:
+                print("  sample:", repr(sample()), flush=True)
+            if ckpt_every and step % ckpt_every == 0:
+                _save("periodic")
+    except KeyboardInterrupt:
+        print("[interrupt]", flush=True); _save("interrupt"); raise
+    except Exception as _e:
+        print("[error] step %d: %r" % (step, _e), flush=True); _save("emergency"); raise
+    else:
+        _save("final")
     print("[done] %.1fs  final sample: %r" % (_time.perf_counter() - t0, sample()), flush=True)
     return rt, tok
 

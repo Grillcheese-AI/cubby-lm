@@ -46,6 +46,15 @@ def cmd_train(args):
     if args.backend == "tape":
         from cubby.trunk.train import train
         train(steps=args.steps, data_path=args.data, tok=args.tokenizer)
+    elif args.sft:
+        # prompt-masked SFT: train p(program | instruction) on (instruction, program)
+        # jsonl pairs, completion-only loss. --data = v4-style jsonl(s).
+        from cubby.trunk.resident import train_cubby_sft
+        train_cubby_sft(version=args.version, steps=args.steps, data=args.data,
+                        B=args.batch, S=args.seqlen, lr=args.lr,
+                        warmup=args.warmup, max_grad_norm=args.clip,
+                        tokenizer=args.tokenizer, ckpt_path=args.ckpt,
+                        sample_prompt=args.prompt)
     else:
         from cubby.trunk.resident import train_cubby_resident
         train_cubby_resident(version=args.version, steps=args.steps, data=args.data,
@@ -94,6 +103,9 @@ def build_parser() -> argparse.ArgumentParser:
     tr.add_argument("--data", default="tinystory_50k.json")
     tr.add_argument("--backend", choices=["resident", "tape"], default="resident",
                     help="resident = GPU-resident single tape (default); tape = numpy/Python-tape model.py")
+    tr.add_argument("--sft", action="store_true",
+                    help="prompt-masked SFT: train p(program|instruction) on (instruction,program) "
+                         "jsonl pairs (--data), completion-only loss. --prompt = the sample instruction.")
     tr.add_argument("--batch", type=int, default=8, help="batch size (resident backend)")
     tr.add_argument("--seqlen", type=int, default=64, help="sequence length (resident backend)")
     tr.add_argument("--lr", type=float, default=3e-3, help="peak learning rate (resident backend)")
