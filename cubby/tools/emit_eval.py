@@ -128,7 +128,8 @@ if __name__ == "__main__":
             gen = generate_from_checkpoint(version=a.version, tokenizer=a.tokenizer,
                                            ckpt_path=a.ckpt, prompt=f"[INSTRUCTION]\n{prompt}\n[/INSTRUCTION]\n",
                                            max_new_tokens=256, temperature=0.0,
-                                           skip_special=False)   # render opcode/role AST tokens into source
+                                           skip_special=False,   # render opcode/role AST tokens into source
+                                           rep_penalty=1.3)      # deterministic + loop-free (no greedy repeats)
             m = re.search(r"(program\s+\w+\s+implements[\s\S]+?\n\})", gen)
             srcs.append(m.group(1) if m else gen)
         score(srcs, label=f"(generated @ {os.path.basename(a.ckpt)})")

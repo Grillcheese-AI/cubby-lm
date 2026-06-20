@@ -332,13 +332,20 @@ class ResidentTrunk:
         return loss, gnorm, False
 
     # --- autoregressive generation (resident forward) ---------------------------
-    def generate(self, prompt_ids, max_new_tokens=80, temperature=0.8, seed=0):
+    def generate(self, prompt_ids, max_new_tokens=80, temperature=0.8, seed=0,
+                 rep_penalty=1.0):
         rng = np.random.default_rng(seed)
         ids = list(np.asarray(prompt_ids, dtype=np.int64).reshape(-1))
+        n_prompt = len(ids)
         for _ in range(max_new_tokens):
             lg = self.logits(np.asarray(ids, dtype=np.int64)[None, :])[0, -1]
             if not np.isfinite(lg).all():
                 break                                       # diverged trunk -> stop, don't crash
+            if rep_penalty != 1.0 and len(ids) > n_prompt:  # CTRL-style repetition penalty
+                gen = np.unique(np.asarray(ids[n_prompt:], dtype=np.int64))
+                pos = lg[gen] > 0
+                lg[gen[pos]] /= rep_penalty
+                lg[gen[~pos]] *= rep_penalty
             if temperature <= 0:
                 nxt = int(lg.argmax())
             else:
@@ -1213,7 +1220,7 @@ def eval_full_softmax_ppl(version="mbpe_v33", data="tinystory_50k.json",
 
 def generate_from_checkpoint(version="mbpe_v33", prompt="The ", tokenizer="mbpe32k",
                              ckpt_path=None, dev=None, max_new_tokens=80,
-                             temperature=0.8, seed=0, skip_special=True):
+                             temperature=0.8, seed=0, skip_special=True, rep_penalty=1.0):
     """Load a checkpoint and free-run from `prompt`. Spot-check coherence and the
     Grilly identity -- for the latter, prompt in the chat format the identity
     corpus uses, e.g.:
@@ -1241,7 +1248,7 @@ def generate_from_checkpoint(version="mbpe_v33", prompt="The ", tokenizer="mbpe3
     _ckpt.apply_model_state(model, ms)
     rt = ResidentTrunk(model, dev or make_device())
     out = rt.generate(tok.encode(prompt), max_new_tokens=max_new_tokens,
-                      temperature=temperature, seed=seed)
+                      temperature=temperature, seed=seed, rep_penalty=rep_penalty)
     text = tok.decode(out, skip_special=skip_special).encode("ascii", "backslashreplace").decode("ascii")
     print("[gen] %s @ step %d  T=%.2f  prompt=%r\n%s"
           % (version, int(meta.get("step", 0)), temperature, prompt, text), flush=True)
