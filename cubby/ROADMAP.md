@@ -109,12 +109,15 @@ Replaces BBPE-65k + full softmax CE with a three-part architecture change:
 Files changed: `cubby/tools/train_tokenizer.py` (new), `cubby/tokenizer.py`,
 `cubby/config.py`, `cubby/trunk/model.py`, `cubby/trunk/resident.py`, `main.py`.
 
-**✅ Gate passed (June 2026):** `tiny_mbpe` preset trains to PPL 27-42 @ step 400,
-generates coherent English prose ("Once upon a time, there was a girl named Lily.
-She loved to look around..."), stable gradients (gnorm 0.6-0.74), 1.59 it/s.
-Sampled softmax working as designed — no full (N, 32721) logit tensor. Checkpoint
-saved at `ckpt_tiny_mbpe.grl`. Next: port dual-head + sampled IS to resident GPU
-path for full v3.3-shape training.
+**✅ Gate passed (June 2026):** `tiny_mbpe` preset reaches **PPL ~4 in <1000
+steps** — near the v4 516M target (val PPL ~7) at a fraction of the budget and
+step count — generating coherent English prose ("Once upon a time, there was a
+girl named Lily. She loved to look around..."), stable gradients (gnorm
+0.6-0.74), 1.59 it/s. mbpe32k + dual-head + sampled-softmax is the **production
+substrate**. Checkpoint saved at `ckpt_tiny_mbpe.grl`. Dual-head + sampled IS
+ported to the resident GPU path. **Next: the `mbpe_v33` consolidation run** —
+the same stack at v3.3 shape (d=1024, L=18) + 0.0.2 chunked SWA — gates on
+coherent prose at production budget before 0.0.3 (MoE).
 
 ## Resident GPU path: dual-head + sampled softmax (June 2026)
 

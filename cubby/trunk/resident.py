@@ -499,7 +499,7 @@ def _read_grads(t, w, emb, ids, BS, d, dff, V, L):
 
 def _fb_grads(t, w, ids, targets, d, dff, V, L):
     """forward+backward + read grads (model.py layout). Returns (grads, logits)."""
-    emb, logits_np, BS = _fb_run(t, w, ids, targets, d, dff, V, L)
+    emb, logits_np, BS, *_ = _fb_run(t, w, ids, targets, d, dff, V, L)
     return _read_grads(t, w, emb, ids, BS, d, dff, V, L), logits_np
 
 
@@ -706,12 +706,145 @@ def loss_curve_match(dev, steps=30):
     return ref, res
 
 
+def _load_token_stream(data, tok, max_tokens, seed=0):
+    """Tokenize up to `max_tokens` ids from `data`, reading only what's needed.
+
+      - .json : list[str] of documents (TinyStories-style). Story order is
+                permuted by `seed`, so different seeds draw different subsets.
+      - .txt  : raw concatenated UTF-8 corpus (e.g. the 134 GB unified pretrain
+                file). Sampled at random *document-aligned* byte offsets so a large
+                heterogeneous corpus contributes its full source mix (multilingual /
+                math / agent / personas), not just whichever source sits at the
+                head. Only ~max_tokens of text is ever read. Different seeds yield
+                near-disjoint subsets -> a free held-out split for eval.
+
+    Returns list[int] of token ids (length ~max_tokens).
+    """
+    import os, json
+    ext = os.path.splitext(data)[1].lower()
+    sb = []
+    if ext == ".json":
+        with open(data, "r", encoding="utf-8") as f:
+            stories = json.load(f)
+        for i in np.random.default_rng(seed).permutation(len(stories)):
+            sb.extend(tok.encode(stories[int(i)] + "\n"))
+            if len(sb) >= max_tokens:
+                break
+        return sb[:max_tokens]
+    # raw text corpus: random document-aligned probes
+    size = os.path.getsize(data)
+    rng = np.random.default_rng(seed)
+    CHUNK = 1 << 20                                          # 1 MB per probe
+    with open(data, "rb") as f:
+        if size <= 4 * CHUNK:                               # small file: just stream it
+            return tok.encode(f.read().decode("utf-8", "ignore"))[:max_tokens]
+        while len(sb) < max_tokens:
+            f.seek(int(rng.integers(0, size - CHUNK)))
+            raw = f.read(CHUNK).decode("utf-8", "ignore")
+            nl = raw.find("\n")                             # drop partial leading doc
+            if nl != -1:
+                raw = raw[nl + 1:]
+            sb.extend(tok.encode(raw))
+    return sb[:max_tokens]
+
+
+def _parse_sources(data):
+    """Parse a data spec into [(path, weight), ...]. Accepts a single path, or a
+    weighted mix `pathA:0.9,pathB:0.1` (weights renormalized). A Windows drive
+    colon (`D:\\..`) is not mistaken for a weight -- only a trailing `:<number>`
+    counts."""
+    out = []
+    for p in (s for s in str(data).split(",") if s.strip()):
+        head, sep, tail = p.rpartition(":")
+        if sep and tail.replace(".", "", 1).strip().isdigit():
+            out.append((head.strip(), float(tail)))
+        else:
+            out.append((p.strip(), 1.0))
+    tot = sum(w for _, w in out) or 1.0
+    return [(p, w / tot) for p, w in out]
+
+
+def _read_source(path, tok, n_tokens, seed):
+    """Read ~n_tokens token ids from one corpus file, reading only what's needed.
+    Supports .json (list[str]), .jsonl (one {'text':..}/line), .txt (raw). Large
+    files (.jsonl/.txt) are sampled at random *record-aligned* byte offsets so a
+    multi-GB heterogeneous corpus contributes its mix, not just its head."""
+    import os, json
+    if not os.path.isabs(path) and not os.path.exists(path):
+        path = os.path.join(_CUBBY_ROOT, path)             # resolve vs repo root
+    ext = os.path.splitext(path)[1].lower()
+    rng = np.random.default_rng(seed)
+    sb = []
+    if ext == ".json":
+        with open(path, "r", encoding="utf-8") as f:
+            docs = json.load(f)
+        for i in rng.permutation(len(docs)):
+            sb.extend(tok.encode(str(docs[int(i)]) + "\n"))
+            if len(sb) >= n_tokens:
+                break
+        return sb[:n_tokens]
+    size = os.path.getsize(path)
+    if ext == ".jsonl":
+        with open(path, "rb") as f:
+            small = size <= (8 << 20)
+            while len(sb) < n_tokens:
+                if not small:
+                    f.seek(int(rng.integers(0, size - (1 << 20))))
+                    f.readline()                           # discard partial line
+                    lines = f.read(1 << 20).decode("utf-8", "ignore").split("\n")[:-1]
+                else:
+                    lines = f.read().decode("utf-8", "ignore").split("\n")
+                for ln in lines:
+                    if not ln.strip():
+                        continue
+                    try:
+                        o = json.loads(ln)
+                    except Exception:
+                        continue
+                    t = o.get("text") or o.get("content") or ""
+                    if t:
+                        sb.extend(tok.encode(t + "\n"))
+                if small:
+                    break
+        return sb[:n_tokens]
+    # .txt raw concatenated corpus
+    CHUNK = 1 << 20
+    with open(path, "rb") as f:
+        if size <= 4 * CHUNK:
+            return tok.encode(f.read().decode("utf-8", "ignore"))[:n_tokens]
+        while len(sb) < n_tokens:
+            f.seek(int(rng.integers(0, size - CHUNK)))
+            raw = f.read(CHUNK).decode("utf-8", "ignore")
+            nl = raw.find("\n")                            # drop partial leading doc
+            if nl != -1:
+                raw = raw[nl + 1:]
+            sb.extend(tok.encode(raw))
+    return sb[:n_tokens]
+
+
+def _load_token_stream(data, tok, max_tokens, seed=0):
+    """Tokenize ~max_tokens ids from one or more weighted sources. A mix
+    (`pathA:0.9,pathB:0.1`) is concatenated by token budget; the random-window
+    batch sampler then draws from each region in proportion to its weight.
+    Different seeds yield near-disjoint subsets -> a free held-out split."""
+    import os
+    srcs = _parse_sources(data)
+    sb = []
+    for k, (path, w) in enumerate(srcs):
+        n = max(1, int(round(w * max_tokens)))
+        got = _read_source(path, tok, n, seed + k * 1009)
+        sb.extend(got)
+        if len(srcs) > 1:
+            print("[data] %-34s w=%.2f  %d tok" % (os.path.basename(path), w, len(got)), flush=True)
+    return sb
+
+
 def train_cubby_resident(version="0.0.0", steps=600, data="tinystory_50k.json",
                          B=8, S=64, lr=3e-4, max_tokens=4000000, sample_every=200,
                          prompt="Once upon a time", gen_tokens=60, dev=None,
                          warmup=0, max_grad_norm=1.0,
                          ckpt_path=None, ckpt_every=100, resume=True, max_consec_skips=10,
-                         tokenizer="bbpe65k"):
+                         tokenizer="bbpe65k", identity_probe=""):
     """Train a CubbyLM via the RESIDENT backend (persistent weights + resident
     AdamW + E host path); sample periodically. The default `main.py train`
     backend. `tokenizer` selects the tokenizer: "bbpe65k" (default), "multilingual_bpe"/
@@ -725,8 +858,6 @@ def train_cubby_resident(version="0.0.0", steps=600, data="tinystory_50k.json",
     from cubby.tokenizer import make_tokenizer
 
     import os
-    if not os.path.isabs(data) and not os.path.exists(data):
-        data = os.path.join(_CUBBY_ROOT, data)             # resolve relative to repo root
     np.random.seed(0)
     cfg = make_config(version)
     tok = make_tokenizer(tokenizer)
@@ -736,14 +867,7 @@ def train_cubby_resident(version="0.0.0", steps=600, data="tinystory_50k.json",
     if hasattr(tok, 'lang_vocab_size') and hasattr(tok, 'n_ast_tokens'):
         cfg.vocab_size = tok.lang_vocab_size
         cfg.n_special_tokens = tok.n_ast_tokens
-    with open(data, "r", encoding="utf-8") as f:
-        stories = json.load(f)
-    sb = []
-    for s in stories:
-        sb.extend(tok.encode(s + "\n"))
-        if len(sb) >= max_tokens:
-            break
-    sb = sb[:max_tokens]
+    sb = _load_token_stream(data, tok, max_tokens, seed=0)
     # Remap path: model vocab smaller than the tokenizer (e.g. 'tiny' preset
     # with vocab=10000 on a 65k tokenizer). Compress IDs into dense [0, vocab)
     # by corpus frequency so targets never exceed the head.
@@ -762,9 +886,11 @@ def train_cubby_resident(version="0.0.0", steps=600, data="tinystory_50k.json",
         ix = rng.integers(0, len(stream) - S - 1, size=B)
         return (np.stack([stream[i:i + S] for i in ix]).astype(np.int64),
                 np.stack([stream[i + 1:i + 1 + S] for i in ix]).astype(np.int64))
-    def sample():
-        s = tok.decode(rt.generate(tok.encode(prompt), max_new_tokens=gen_tokens))
+    def _gen(p):
+        s = tok.decode(rt.generate(tok.encode(p), max_new_tokens=gen_tokens))
         return s.encode("ascii", "backslashreplace").decode("ascii")          # cp1252 console
+    def sample():
+        return _gen(prompt)
 
     from cubby.trunk import checkpoint as _ckpt
     if ckpt_path is None:
@@ -796,12 +922,20 @@ def train_cubby_resident(version="0.0.0", steps=600, data="tinystory_50k.json",
         except Exception as _e:
             print("[ckpt] save FAILED (%s): %r" % (tag, _e), flush=True)
 
+    # Honor the preset's sampled-softmax flag on the resident path (else the
+    # full (N, V) logit tensor is materialized; tolerable at V<=32k, but the
+    # flag must actually take effect when set).
+    use_sampled = bool(getattr(cfg, "enable_sampled_softmax", False))
+    n_samples = int(getattr(cfg, "n_samples", 1024))
+    if use_sampled:
+        print("[ce] sampled softmax: K=%d negatives/token" % n_samples, flush=True)
     t0 = _time.perf_counter(); nskip = 0
     try:
         for step in range(start_step + 1, steps + 1):
             ids, tgt = batch()
             lr_t = lr * min(1.0, step / warmup) if warmup else lr  # linear LR warmup
-            loss, gnorm, skipped = rt.train_step(ids, tgt, step, lr=lr_t, max_grad_norm=max_grad_norm)
+            loss, gnorm, skipped = rt.train_step(ids, tgt, step, lr=lr_t, max_grad_norm=max_grad_norm,
+                                                 use_sampled=use_sampled, n_samples=n_samples)
             nskip += int(skipped)
             print("[%4d/%d] ce=%.3f ppl=%.1f gnorm=%.2e lr=%.1e (%.2f it/s)%s"
                   % (step, steps, loss, np.exp(loss), gnorm, lr_t,
@@ -811,6 +945,8 @@ def train_cubby_resident(version="0.0.0", steps=600, data="tinystory_50k.json",
                 _save("diverge"); break
             if sample_every and step % sample_every == 0:
                 print("  sample:", repr(sample()), flush=True)
+                if identity_probe:
+                    print("  ident :", repr(_gen(identity_probe)), flush=True)
             if ckpt_every and step % ckpt_every == 0:
                 _save("periodic")
     except KeyboardInterrupt:
@@ -824,6 +960,107 @@ def train_cubby_resident(version="0.0.0", steps=600, data="tinystory_50k.json",
         print("[warn] %d step(s) skipped (non-finite grad)" % nskip, flush=True)
     print("[done] %.1fs  final sample: %r" % (_time.perf_counter() - t0, sample()), flush=True)
     return rt, tok
+
+
+def eval_full_softmax_ppl(version="mbpe_v33", data="tinystory_50k.json",
+                          tokenizer="mbpe32k", ckpt_path=None, dev=None,
+                          n_batches=40, B=4, S=128, eval_tokens=400000, seed=98765):
+    """UNWEIGHTED full-softmax language-head perplexity -- the comparable PPL the
+    router-weighted *sampled* training loss does NOT report.
+
+    Training prints ~0.5x the true language NLL: the untrained router halves the
+    language weight (w_lang ~ 0.5) and TinyStories has no AST mass, so the loss is
+    `w_lang * sampled_lang_NLL`. This evaluates the language head with the COMPLETE
+    (BS, Vlang) softmax over a held-out tail slice, unweighted -- directly
+    comparable to the tiny-scale full-softmax PPL. AST targets are excluded.
+
+    Run this when the training process is IDLE: two Vulkan contexts sharing 12 GB
+    VRAM will contend (see the resident trunk's persistent weights + Adam state).
+    Loads `ckpt_path` (default ckpt_<version>.grl).
+    """
+    import json, os
+    force_numpy_reference()                                 # resident path owns the GPU
+    from cubby.config import make_config
+    from cubby.trunk.model import CubbyLM
+    from cubby.tokenizer import make_tokenizer
+    from cubby.trunk import checkpoint as _ckpt
+
+    cfg = make_config(version)
+    tok = make_tokenizer(tokenizer)
+    if hasattr(tok, 'lang_vocab_size') and hasattr(tok, 'n_ast_tokens'):
+        cfg.vocab_size = tok.lang_vocab_size
+        cfg.n_special_tokens = tok.n_ast_tokens
+    Vlang = int(cfg.vocab_size)
+
+    # seed 7777 != the trainer's seed 0 -> near-disjoint held-out sample
+    stream = np.asarray(_load_token_stream(data, tok, eval_tokens, seed=7777), dtype=np.int64)
+
+    if ckpt_path is None:
+        ckpt_path = os.path.join(_CUBBY_ROOT, "ckpt_%s.grl" % version)
+    if not os.path.exists(ckpt_path):
+        raise SystemExit("no checkpoint at %s -- train first" % ckpt_path)
+    model = CubbyLM(cfg)
+    ms, meta = _ckpt.load_checkpoint(ckpt_path)
+    if not _ckpt.checkpoint_matches(meta, cfg):
+        raise SystemExit("checkpoint shape mismatch for version %s" % version)
+    _ckpt.apply_model_state(model, ms)
+    rt = ResidentTrunk(model, dev or make_device())
+
+    rng = np.random.default_rng(seed)
+    tot_nll, tot_tok = 0.0, 0
+    for _ in range(n_batches):
+        ix = rng.integers(0, len(stream) - S - 1, size=B)
+        ids = np.stack([stream[i:i + S] for i in ix]).astype(np.int64)
+        tgt = np.stack([stream[i + 1:i + 1 + S] for i in ix]).astype(np.int64).reshape(-1)
+        logits = rt.logits(ids)[:, :, :Vlang].reshape(B * S, Vlang)
+        lang = tgt < Vlang                                   # exclude AST targets
+        lg, tt = logits[lang], tgt[lang]
+        lg = lg - lg.max(axis=1, keepdims=True)
+        lse = np.log(np.exp(lg).sum(axis=1))
+        tot_nll += float((lse - lg[np.arange(len(tt)), tt]).sum())
+        tot_tok += int(len(tt))
+    ce = tot_nll / max(tot_tok, 1)
+    print("[eval] %s @ step %d  full-softmax lang-head CE=%.4f  PPL=%.2f  "
+          "(%d tokens, Vlang=%d)" % (version, int(meta.get("step", 0)), ce,
+                                     float(np.exp(ce)), tot_tok, Vlang), flush=True)
+    return ce, float(np.exp(ce))
+
+
+def generate_from_checkpoint(version="mbpe_v33", prompt="The ", tokenizer="mbpe32k",
+                             ckpt_path=None, dev=None, max_new_tokens=80,
+                             temperature=0.8, seed=0):
+    """Load a checkpoint and free-run from `prompt`. Spot-check coherence and the
+    Grilly identity -- for the latter, prompt in the chat format the identity
+    corpus uses, e.g.:
+        <|system|>\\nYou are Grilly, a helpful assistant.\\n<|user|>\\nWho are you?\\n<|assistant|>\\n
+    Run when the trainer is idle (shared 12 GB VRAM)."""
+    import os
+    force_numpy_reference()                                 # resident path owns the GPU
+    from cubby.config import make_config
+    from cubby.trunk.model import CubbyLM
+    from cubby.tokenizer import make_tokenizer
+    from cubby.trunk import checkpoint as _ckpt
+    cfg = make_config(version)
+    tok = make_tokenizer(tokenizer)
+    if hasattr(tok, 'lang_vocab_size') and hasattr(tok, 'n_ast_tokens'):
+        cfg.vocab_size = tok.lang_vocab_size
+        cfg.n_special_tokens = tok.n_ast_tokens
+    if ckpt_path is None:
+        ckpt_path = os.path.join(_CUBBY_ROOT, "ckpt_%s.grl" % version)
+    if not os.path.exists(ckpt_path):
+        raise SystemExit("no checkpoint at %s -- train first" % ckpt_path)
+    model = CubbyLM(cfg)
+    ms, meta = _ckpt.load_checkpoint(ckpt_path)
+    if not _ckpt.checkpoint_matches(meta, cfg):
+        raise SystemExit("checkpoint shape mismatch for version %s" % version)
+    _ckpt.apply_model_state(model, ms)
+    rt = ResidentTrunk(model, dev or make_device())
+    out = rt.generate(tok.encode(prompt), max_new_tokens=max_new_tokens,
+                      temperature=temperature, seed=seed)
+    text = tok.decode(out).encode("ascii", "backslashreplace").decode("ascii")
+    print("[gen] %s @ step %d  T=%.2f  prompt=%r\n%s"
+          % (version, int(meta.get("step", 0)), temperature, prompt, text), flush=True)
+    return text
 
 
 def train_demo(dev, steps=150, tokens=400000):

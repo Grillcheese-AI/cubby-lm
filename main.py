@@ -51,10 +51,28 @@ def cmd_train(args):
         train_cubby_resident(version=args.version, steps=args.steps, data=args.data,
                              B=args.batch, S=args.seqlen, lr=args.lr,
                              warmup=args.warmup, max_grad_norm=args.clip,
-                             tokenizer=args.tokenizer)
+                             tokenizer=args.tokenizer, ckpt_path=args.ckpt,
+                             prompt=args.prompt, identity_probe=args.identity_probe)
 
 
-def cmd_gen(args):    _todo("gen")
+def cmd_eval(args):
+    """Unweighted full-softmax language-head perplexity from a checkpoint -- the
+    comparable PPL the router-weighted sampled training loss does NOT print. Run
+    when the trainer is idle (shared 12 GB VRAM)."""
+    from cubby.trunk.resident import eval_full_softmax_ppl
+    eval_full_softmax_ppl(version=args.version, data=args.data,
+                          tokenizer=args.tokenizer, ckpt_path=args.ckpt,
+                          B=args.batch, S=args.seqlen, n_batches=args.batches)
+
+
+def cmd_gen(args):
+    """Free-run from a checkpoint. For the Grilly identity, prompt in the chat
+    format the identity corpus uses (--prompt). Run when the trainer is idle."""
+    from cubby.trunk.resident import generate_from_checkpoint
+    generate_from_checkpoint(version=args.version, prompt=args.prompt,
+                             tokenizer=args.tokenizer, ckpt_path=args.ckpt,
+                             max_new_tokens=args.max_new_tokens,
+                             temperature=args.temperature)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -83,9 +101,29 @@ def build_parser() -> argparse.ArgumentParser:
     tr.add_argument("--tokenizer", default="bbpe65k",
                     choices=["bbpe65k", "multilingual_bpe", "mbpe32k", "byte"],
                     help="tokenizer to use (default: bbpe65k)")
-    gn = add("gen", cmd_gen, "autoregressive generation")
-    gn.add_argument("--prompt", default="Once upon a time, ")
-    gn.add_argument("--max-new-tokens", type=int, default=200)
+    tr.add_argument("--ckpt", default=None,
+                    help="checkpoint path (default ckpt_<version>.grl). --data accepts a "
+                         "single file (.json/.jsonl/.txt) or a weighted mix 'a:0.9,b:0.1'")
+    tr.add_argument("--prompt", default="The ",
+                    help="periodic-sample prompt (default neutral; use a domain-matched one)")
+    tr.add_argument("--identity-probe", dest="identity_probe",
+                    default="<|system|>\nYou are Grilly, a helpful assistant.\n<|user|>\nWho are you?\n<|assistant|>\n",
+                    help="extra chat-format sample to watch identity uptake ('' to disable)")
+    ev = add("eval", cmd_eval, "unweighted full-softmax lang-head PPL from a checkpoint")
+    ev.add_argument("--data", default="tinystory_50k.json")
+    ev.add_argument("--tokenizer", default="mbpe32k",
+                    choices=["bbpe65k", "multilingual_bpe", "mbpe32k", "byte"])
+    ev.add_argument("--ckpt", default=None, help="checkpoint path (default ckpt_<version>.grl)")
+    ev.add_argument("--batch", type=int, default=4)
+    ev.add_argument("--seqlen", type=int, default=128)
+    ev.add_argument("--batches", type=int, default=40, help="eval batches to average over")
+    gn = add("gen", cmd_gen, "autoregressive generation from a checkpoint")
+    gn.add_argument("--prompt", default="The ")
+    gn.add_argument("--max-new-tokens", dest="max_new_tokens", type=int, default=200)
+    gn.add_argument("--tokenizer", default="mbpe32k",
+                    choices=["bbpe65k", "multilingual_bpe", "mbpe32k", "byte"])
+    gn.add_argument("--ckpt", default=None, help="checkpoint path (default ckpt_<version>.grl)")
+    gn.add_argument("--temperature", type=float, default=0.8, help="0 = greedy/argmax")
     return p
 
 

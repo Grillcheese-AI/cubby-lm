@@ -49,9 +49,13 @@ def resident_model_state(rt):
             gate_up=np.concatenate([gu[dff:2 * dff], gu[0:dff]], axis=0),  # un-swap
             down=_read(rt, lw['down']['w'], [d, dff]),
         )
-    return dict(embed=_read(rt, rt.E['w'], [V, d]),
-                final=_read(rt, rt.final['w'], [d]),
-                blocks=blocks)
+    state = dict(embed=_read(rt, rt.E['w'], [V, d]),     # combined [E_lang; E_ast] for dual-head
+                 final=_read(rt, rt.final['w'], [d]),
+                 blocks=blocks)
+    if rt.router is not None:                            # dual-head: persist the router too
+        rows = rt.router['n'] // d
+        state['router'] = _read(rt, rt.router['w'], [rows, d])
+    return state
 
 
 def resident_moments(rt):
@@ -101,8 +105,20 @@ def checkpoint_matches(meta, cfg):
 def apply_model_state(model, model_state):
     """Restore saved model-layout weights INTO a CubbyLM's Variables, in place, so a
     freshly-built ResidentTrunk(model) comes up with the trained weights."""
-    model.embed.data[...] = model_state["embed"]
-    model.final.data[...] = model_state["final"]
+    emb = np.asarray(model_state["embed"])
+    if getattr(model, "dual_head", False):
+        # saved 'embed' is the resident COMBINED [E_lang; E_ast]; split it back.
+        Vlang = model.embed_lang.data.shape[0]
+        model.embed_lang.data[...] = emb[:Vlang]
+        if model.embed_ast is not None:
+            Vast = model.embed_ast.data.shape[0]
+            model.embed_ast.data[...] = emb[Vlang:Vlang + Vast]
+        model.final_lang.data[...] = model_state["final"]
+        if "router" in model_state and model.router is not None:
+            model.router.data[...] = model_state["router"]   # absent in pre-fix ckpts -> keep init
+    else:
+        model.embed.data[...] = emb
+        model.final.data[...] = model_state["final"]
     for i, b in enumerate(model.blocks):
         bs = model_state["blocks"][str(i)]
         b.n1.data[...] = bs["n1"]

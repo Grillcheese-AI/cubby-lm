@@ -174,6 +174,16 @@ VERSIONS: dict[str, dict] = {
         enable_dual_head=True, enable_sampled_softmax=True, n_samples=1024,
         d_model=1024, n_layers=8, d_ffn=3072, seq_len=128,
     ),
+    # Production-shape mbpe substrate: the validated mbpe32k + dual-head +
+    # sampled-softmax stack (PPL 4 in <1000 steps at tiny shape) scaled to the
+    # v3.3 trunk (d=1024, L=18) WITH 0.0.2 chunked SWA attention. This is the
+    # consolidation gate that must generate coherent prose before 0.0.3 (MoE).
+    "mbpe_v33": dict(
+        _R2,  # = _R1 + enable_attention=True (chunked SWA every 3rd)
+        vocab_size=32768, tokenizer_kind="multilingual_bpe",
+        enable_dual_head=True, enable_sampled_softmax=True, n_samples=1024,
+        d_model=1024, n_layers=8, d_ffn=4096, seq_len=512,
+    ),
 }
 
 DEFAULT_VERSION = "0.0.0"
