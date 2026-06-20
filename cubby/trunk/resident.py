@@ -1094,7 +1094,8 @@ def train_cubby_sft(version="mbpe_emit", steps=2000, data="", B=8, S=256, lr=3e-
     def sample():
         out = rt.generate(tok.encode("[INSTRUCTION]\n%s\n[/INSTRUCTION]\n" % sample_prompt),
                           max_new_tokens=gen_tokens, temperature=0.0)
-        return tok.decode(out).encode("ascii", "backslashreplace").decode("ascii")
+        # skip_special=False: render opcode/role AST tokens as literal source
+        return tok.decode(out, skip_special=False).encode("ascii", "backslashreplace").decode("ascii")
 
     if ckpt_path is None:
         ckpt_path = os.path.join(_CUBBY_ROOT, "ckpt_%s.grl" % version)
@@ -1212,7 +1213,7 @@ def eval_full_softmax_ppl(version="mbpe_v33", data="tinystory_50k.json",
 
 def generate_from_checkpoint(version="mbpe_v33", prompt="The ", tokenizer="mbpe32k",
                              ckpt_path=None, dev=None, max_new_tokens=80,
-                             temperature=0.8, seed=0):
+                             temperature=0.8, seed=0, skip_special=True):
     """Load a checkpoint and free-run from `prompt`. Spot-check coherence and the
     Grilly identity -- for the latter, prompt in the chat format the identity
     corpus uses, e.g.:
@@ -1241,7 +1242,7 @@ def generate_from_checkpoint(version="mbpe_v33", prompt="The ", tokenizer="mbpe3
     rt = ResidentTrunk(model, dev or make_device())
     out = rt.generate(tok.encode(prompt), max_new_tokens=max_new_tokens,
                       temperature=temperature, seed=seed)
-    text = tok.decode(out).encode("ascii", "backslashreplace").decode("ascii")
+    text = tok.decode(out, skip_special=skip_special).encode("ascii", "backslashreplace").decode("ascii")
     print("[gen] %s @ step %d  T=%.2f  prompt=%r\n%s"
           % (version, int(meta.get("step", 0)), temperature, prompt, text), flush=True)
     return text

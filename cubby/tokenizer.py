@@ -30,7 +30,7 @@ class ByteTokenizer:
     def encode(self, text: str):
         return list(text.encode("utf-8", "ignore"))
 
-    def decode(self, ids):
+    def decode(self, ids, skip_special=True):
         return bytes(int(i) & 0xFF for i in ids).decode("utf-8", "replace")
 
 
@@ -46,8 +46,8 @@ class BPETokenizer:
     def encode(self, text: str):
         return self.tok.encode(text).ids
 
-    def decode(self, ids):
-        return self.tok.decode([int(i) for i in ids])
+    def decode(self, ids, skip_special=True):
+        return self.tok.decode([int(i) for i in ids], skip_special_tokens=skip_special)
 
 
 class MultilingualBPE:
@@ -107,8 +107,8 @@ class MultilingualBPE:
     def encode(self, text: str) -> list[int]:
         return self.tok.encode(text).ids
 
-    def decode(self, ids) -> str:
-        return self.tok.decode([int(i) for i in ids])
+    def decode(self, ids, skip_special=True) -> str:
+        return self.tok.decode([int(i) for i in ids], skip_special_tokens=skip_special)
 
     def is_ast_token(self, token_id: int) -> bool:
         return int(token_id) in self.ast_token_ids
@@ -147,9 +147,9 @@ class RemapTokenizer:
     def encode(self, text: str):
         return self.encode_base(self.base.encode(text))
 
-    def decode(self, ids):
+    def decode(self, ids, skip_special=True):
         inv = self.inv
-        return self.base.decode([inv[i] for i in (int(x) for x in ids) if i in inv])
+        return self.base.decode([inv[i] for i in (int(x) for x in ids) if i in inv], skip_special)
 
 
 class DualHeadRemap:
@@ -193,8 +193,8 @@ class DualHeadRemap:
     def encode(self, text):
         return self._map(self.base.encode(text))
 
-    def decode(self, ids):
-        return self.base.decode(self._map(ids))
+    def decode(self, ids, skip_special=True):
+        return self.base.decode(self._map(ids), skip_special)
 
     def is_ast_token(self, token_id):
         return int(token_id) in self.ast_token_ids
