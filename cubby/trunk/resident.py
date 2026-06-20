@@ -285,11 +285,12 @@ class ResidentTrunk:
 
     def train_step_sft(self, ids, targets, mask, step, lr=3e-4, betas=(0.9, 0.95),
                        eps=1e-8, wd=0.01, max_grad_norm=1.0):
-        """One resident step with PROMPT-MASKED (completion-only) loss: CE is
-        computed and backpropped ONLY where mask==1 (the program tokens), so the
-        model learns p(program | instruction) and never wastes capacity generating
-        the NL instruction. Custom dlogits are seeded at the head node (see
-        _fb_run dlogits_fn). Returns (masked-mean CE, pre-clip gnorm, skipped)."""
+        """One resident step with PROMPT-MASKED (completion-only) loss, computed
+        ENTIRELY ON-GPU via fused_ce: CE + grad only where mask==1 (program tokens),
+        so the model learns p(program | instruction). Masked positions get the
+        sentinel target V (>= vocab) so fused_ce's ignore-index zeros their loss+grad
+        on-device -- no 268 MB logits readback, no host softmax. Returns
+        (masked-mean CE, pre-clip gnorm, skipped)."""
         d, V = self.d, self.V
         ids = np.asarray(ids, dtype=np.int64); B, S = ids.shape; BS = B * S
         tgt = np.asarray(targets, np.int64).reshape(-1)
@@ -297,22 +298,24 @@ class ResidentTrunk:
         n_comp = float(m.sum())
         if n_comp < 1.0:
             return 0.0, 0.0, True
-        box = {}
-        def dlogits_fn(logits_np):
-            z = logits_np - logits_np.max(axis=1, keepdims=True)
-            sm = np.exp(z); sm /= sm.sum(axis=1, keepdims=True)
-            nll = -np.log(sm[np.arange(BS), tgt] + 1e-12)
-            box['loss'] = float((nll * m).sum() / n_comp)        # masked-mean CE
-            sm[np.arange(BS), tgt] -= 1.0                        # softmax - onehot
-            sm *= m[:, None]                                     # zero prompt/pad (raw sum)
-            return sm
+        # ignore-index: prompt/pad positions -> sentinel target V (out of range)
+        tgt_masked = np.where(m > 0, tgt, V).astype(np.uint32)
         t = self.t; t.begin()
         w = self._w()
+        box = {}
+        def gpu_seed(logits_id, nHead, bs):                      # on-GPU fused masked CE
+            tu = t.register_input_u32(tgt_masked)
+            t.forward_begin()
+            losses_id, grad_id = t.fused_ce(logits_id, tu, bs, V)
+            t.forward_submit()
+            box['losses_id'] = losses_id
+            return grad_id
         attn_H = self.attn_n_heads if self.has_attn else 0
         emb, _, _, _, _, _, _, _ = _fb_run(
             t, w, ids, targets, d, self.dff, V, self.L,
-            attn_heads=attn_H, attn_window=self.attn_window, dlogits_fn=dlogits_fn)
-        loss = box.get('loss', 0.0)
+            attn_heads=attn_H, attn_window=self.attn_window, gpu_seed=gpu_seed)
+        losses = np.asarray(t.read_buffer(box['losses_id'], [BS]))  # BS floats (~tiny)
+        loss = float(losses.sum() / n_comp)                        # masked rows are 0
         ids_u32 = t.register_input_u32(ids.reshape(-1).astype(np.uint32))
         t.embedding_scatter_add(t.get_grad_buffer(emb), ids_u32,
                                 t.get_grad_buffer(self.E['w']), BS, d)
@@ -445,7 +448,7 @@ def _resident_forward(t, w, ids, d, dff, V, L,
 
 
 def _fb_run(t, w, ids, targets, d, dff, V, L, Vlang=None, Vast=None,
-            attn_heads=0, attn_window=0, dlogits_fn=None):
+            attn_heads=0, attn_window=0, dlogits_fn=None, gpu_seed=None):
     """Resident forward + backward (records the matching graph, one backward()).
     Returns (emb_id, logits_numpy, BS, router_logits_np, nf_id, logits_id, Vlang, Vast).
     Grad buffers are then readable via t.get_grad_buffer(weight_id) / get_grad_buffer(emb_id).
@@ -463,7 +466,7 @@ def _fb_run(t, w, ids, targets, d, dff, V, L, Vlang=None, Vast=None,
     emb, logits, cap, nf, B, S, router_logits_id = _resident_forward(
         t, w, ids, d, dff, V, L)
     BS = B * S
-    logits_np = t.read_buffer(logits, [BS, V])
+    logits_np = None if gpu_seed is not None else t.read_buffer(logits, [BS, V])
     router_logits_np = None
     if router_logits_id is not None:
         router_logits_np = t.read_buffer(router_logits_id, [BS, 2])
@@ -530,7 +533,11 @@ def _fb_run(t, w, ids, targets, d, dff, V, L, Vlang=None, Vast=None,
     nHead = t.record_op(op.Linear, [_R(nf, [BS, d]), _R(E_id, [V, d])], [_R(logits, [BS, V])]); t.save_for_backward(nHead, [nf, E_id])
     if router_logits_id is not None:
         nRouter = t.record_op(op.Linear, [_R(nf, [BS, d]), _R(router_id, [2, d])], [_R(router_logits_id, [BS, 2])]); t.save_for_backward(nRouter, [nf, router_id])
-    if dlogits_fn is not None:
+    if gpu_seed is not None:
+        # On-GPU custom loss (fused CE): grad computed on-device + seeded directly
+        # at the head node -- NO 268 MB logits readback, no host softmax.
+        t.backward(nHead, gpu_seed(logits, nHead, BS))
+    elif dlogits_fn is not None:
         # Custom loss (e.g. prompt-masked SFT): seed the head node's output grad
         # directly with host-computed dlogits, skipping the GPU CrossEntropy node.
         dl = np.ascontiguousarray(dlogits_fn(logits_np), dtype=np.float32)
